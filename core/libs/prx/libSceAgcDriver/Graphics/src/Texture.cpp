@@ -1886,6 +1886,7 @@ void traceKeyStore(const char* path, const GuestTextureResource& descriptor, std
 }
 
 void StorageTexture::captureGuestBytes(const std::vector<bool>* layers) {
+    original.resize(static_cast<std::size_t>(guestBytes));
     comparedGuestBytes = {};
     std::vector<bool> selected(trackedLayers, true);
     if (layers != nullptr) selected = *layers;
@@ -1953,7 +1954,6 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
     CaptureTrace::Log("upload image=%llx bytes=%llu generation=%llu reason=%s partial=%d", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), static_cast<unsigned long long>(generation), uploadReason, layers != nullptr);
     const auto elementBytes = BytesPerElement(descriptor.format);
     const auto linearBytes = sliceLinearBytes * arrayLayers;
-    original.resize(static_cast<std::size_t>(guestBytes));
     // A layer selection applies to the direct path alone (the others upload everything); it names
     // array layers, which the tracked layers are when there are several.
     if (layers != nullptr && ((!blockUnits && trackedLayers != arrayLayers) || std::all_of(layers->begin(), layers->end(), [](bool selected) { return selected; }))) layers = nullptr;
@@ -2157,6 +2157,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
     layerOriginal.assign(trackedLayers, true);
     forgetBorrowed(0, trackedLayers);
     stampLayers(false);
+    original.resize(static_cast<std::size_t>(guestBytes));
     GuestMemory::ReadCommitted(descriptor.baseAddress, original);
     {
             Buffer staging(context, original.size(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
@@ -4300,6 +4301,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         }
         return;
     }
+    original.resize(static_cast<std::size_t>(guestBytes));
     // The store below compares against the guest bytes, read now when `original` does not hold
     // them (a GPU clear, a dropped or kept unit). Reading them says nothing about the image: a
     // stale unit (dropped, or kept for the CPU) still differs from them, so `original` vouches for

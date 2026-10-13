@@ -31,6 +31,7 @@ add_library(libkernel SHARED EXCLUDE_FROM_ALL
         ${CMAKE_CURRENT_SOURCE_DIR}/Pthread/src/Tsd.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Pthread/src/Rwlock.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Pthread/src/Sem.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Pthread/Posix/Atfork.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Pthread/Posix/Attr.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Pthread/Posix/Barrier.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Pthread/Posix/Cond.cpp
@@ -649,6 +650,15 @@ if(BUILD_TESTING)
     add_test(NAME guest_parent_process COMMAND guest_parent_process_tests)
     if(WIN32)
         set_tests_properties(guest_parent_process PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
+    endif()
+    add_test_executable(guest_pthread_atfork_tests ${LIBS_INCLUDE_DIR}/tests/GuestPthreadAtfork.cpp)
+    target_include_directories(guest_pthread_atfork_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(guest_pthread_atfork_tests PRIVATE libkernel libc)
+    configure_windows_unwind(guest_pthread_atfork_tests)
+    add_test(NAME guest_pthread_atfork COMMAND guest_pthread_atfork_tests)
+    if(WIN32)
+        set_tests_properties(guest_pthread_atfork PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
     endif()
     add_test_executable(guest_kill_tests ${LIBS_INCLUDE_DIR}/tests/GuestKill.cpp)

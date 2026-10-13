@@ -240,6 +240,7 @@ inline Registers BuildInitialContextRegisters() {
         result.emplace(0x31c + 0xfu * i, 0);
     }
     for (std::uint32_t i = 0; i < 16; ++i) {
+        result.emplace(0x2fe + i, 0);
         result.emplace(0x94 + 2 * i, 0x80000000);
         result.emplace(0x95 + 2 * i, 0x40004000);
         result.emplace(0xb4 + 2 * i, 0);

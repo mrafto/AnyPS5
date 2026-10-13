@@ -2,7 +2,9 @@
 
 Tool for automatic executables porting to Linux and Windows.
 
-[**Online converter**](https://boykopovar.github.io/AnyPS5/) - files stay on your device.
+[**Web converter**](https://boykopovar.github.io/AnyPS5/) - files stay on your device.
+
+![anyps5_collage1](https://github.com/user-attachments/assets/0f8e13e8-1cb7-4c69-8075-39978e138994)
 
 [Discord](https://discord.gg/BHFztBPUe)
 

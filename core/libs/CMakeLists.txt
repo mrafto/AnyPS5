@@ -437,6 +437,16 @@ if(BUILD_TESTING)
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libScePosixForWebKit>")
     endif()
 
+    add_test_executable(MemoryPoolTest
+        tests/MemoryPoolTest.cpp
+        prx/libkernel/DirectMemory/MemoryPool.cpp
+    )
+    target_include_directories(MemoryPoolTest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    if(MINGW)
+        target_compile_options(MemoryPoolTest PRIVATE -fasynchronous-unwind-tables)
+    endif()
+    add_test(NAME MemoryPoolTest COMMAND MemoryPoolTest)
+
     add_test_executable(guest_acm_tests tests/GuestAcm.cpp)
     target_include_directories(guest_acm_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     target_link_libraries(guest_acm_tests PRIVATE libSceAcm libc)
