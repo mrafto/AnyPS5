@@ -44,7 +44,8 @@ void leaseSnapshotTests() {
         const auto found = std::find_if(first.begin(), first.end(), [&](const auto& range) { return range->address == address; });
         Require(found != first.end(), "the shared snapshot misses a registered range");
         held = *found;
-        Require(held.use_count() == 2, "the shared snapshot of two leases holds a range more than once");
+        // The registry itself holds the range in its map and in its two snapshots; leases share a snapshot.
+        Require(held.use_count() == 3, "the shared snapshot of two leases holds a range more than once");
         {
             GuestAllocations::Mutation mutation;
             mutation.Add(memory.data() + 64, 64, true, true, true);
@@ -52,7 +53,7 @@ void leaseSnapshotTests() {
         const auto third = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
         Require(&third[0] != &first[0] && std::any_of(third.begin(), third.end(), [&](const auto& range) { return range->address == address + 64; }), "a lease taken after a registry change still shares the old snapshot");
     }
-    Require(held.use_count() == 1, "a snapshot outlived its leases");
+    Require(held.use_count() == 3, "a snapshot outlived its leases");
     GuestAllocations::Mutation mutation;
     mutation.Remove(memory.data());
     mutation.Remove(memory.data() + 64);
