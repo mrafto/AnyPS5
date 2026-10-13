@@ -36,8 +36,9 @@ struct Registry {
     std::map<std::uint64_t, std::shared_ptr<const Range>> ranges;
     bool mainImageRegistered = false;
     std::map<std::uintptr_t, std::uintptr_t> registeredImages;
-    std::weak_ptr<const Lease::Ranges> readableLease;
-    std::weak_ptr<const Lease::Ranges> allLease;
+    std::shared_ptr<Lease::Ranges> allSnapshot;
+    std::shared_ptr<Lease::Ranges> readableSnapshot;
+    bool snapshotsDirty = true;
 };
 
 Registry& registry() {
@@ -57,6 +58,48 @@ std::chrono::milliseconds pinWait() {
         return text != nullptr ? std::strtoull(text, nullptr, 10) : 60000ull;
     }()};
     return value;
+}
+
+void ensureSnapshots() {
+    auto& state = registry();
+    if (!state.snapshotsDirty) return;
+    auto all = std::make_shared<Lease::Ranges>();
+    auto readable = std::make_shared<Lease::Ranges>();
+    all->reserve(state.ranges.size());
+    for (const auto& [address, range] : state.ranges) {
+        if (range->bytes == 0) continue;
+        all->push_back(range);
+        if (range->readable) readable->push_back(range);
+    }
+    state.allSnapshot = std::move(all);
+    state.readableSnapshot = std::move(readable);
+    state.snapshotsDirty = false;
+}
+
+void markSnapshotsDirty() {
+    registry().snapshotsDirty = true;
+}
+
+void resyncSnapshot(std::shared_ptr<Lease::Ranges>& snapshot, std::uint64_t first, std::uint64_t last, bool readableOnly) {
+    if (snapshot.use_count() > 1) snapshot = std::make_shared<Lease::Ranges>(*snapshot);
+    const auto less = [](const std::shared_ptr<const Range>& range, std::uint64_t value) { return range->address < value; };
+    const auto from = std::lower_bound(snapshot->begin(), snapshot->end(), first, less);
+    const auto to = std::lower_bound(from, snapshot->end(), last, less);
+    Lease::Ranges replacement;
+    const auto& ranges = registry().ranges;
+    for (auto it = ranges.lower_bound(first); it != ranges.end() && it->first < last; ++it) {
+        if (it->second->bytes != 0 && (!readableOnly || it->second->readable)) replacement.push_back(it->second);
+    }
+    const auto index = from - snapshot->begin();
+    snapshot->erase(from, to);
+    snapshot->insert(snapshot->begin() + index, replacement.begin(), replacement.end());
+}
+
+void noteRangesChanged(std::uint64_t first, std::uint64_t last) {
+    auto& state = registry();
+    if (state.snapshotsDirty) return;
+    resyncSnapshot(state.allSnapshot, first, last, false);
+    resyncSnapshot(state.readableSnapshot, first, last, true);
 }
 
 void require(bool condition, const char* reason) {
@@ -111,10 +154,7 @@ bool backWritableImageAnonymously() {
 }
 
 void* GuestAllocationsBegin_nid_postfix() {
-    auto* state = new MutationState{std::unique_lock<std::mutex>(registry().mutex), {}};
-    registry().readableLease.reset();
-    registry().allLease.reset();
-    return state;
+    return new MutationState{std::unique_lock<std::mutex>(registry().mutex), {}};
 }
 
 void GuestAllocationsEnd_nid_postfix(void* mutation) noexcept {
@@ -142,8 +182,6 @@ void GuestAllocationsEnd_nid_postfix(void* mutation) noexcept {
     const Mapped weak(mapped.begin(), mapped.end());
     mapped.clear();
     const bool noted = !state->gpuMapped.empty();
-    registry().readableLease.reset();
-    registry().allLease.reset();
     delete state;
     if (!weak.empty()) observer(weak, ended);
     if (noted) gpuMapObserverCalls.fetch_sub(1);
@@ -208,6 +246,7 @@ void registerImage(const void* image) {
     }
     require(registered, "guest image has no committed pages");
     state.ranges.swap(replacement);
+    markSnapshotsDirty();
     state.registeredImages.emplace(reinterpret_cast<std::uintptr_t>(image), cursor);
 }
 }
@@ -235,6 +274,7 @@ void GuestAllocationsUnregisterImage_nid_postfix(void* mutation, const void* ima
     recordChange(mutation, image, end - begin);
     std::erase_if(state.ranges, [&](const auto& entry) { return !entry.second->releasable && entry.second->allocationAddress >= begin && entry.second->allocationAddress < end; });
     state.registeredImages.erase(found);
+    markSnapshotsDirty();
 }
 #else
 void GuestAllocationsRegisterMainImage_nid_postfix(void*) {
@@ -279,6 +319,7 @@ void GuestAllocationsRegisterMainImage_nid_postfix(void*) {
         page = std::next(last);
     }
     state.ranges.swap(replacement);
+    markSnapshotsDirty();
     state.mainImageRegistered = true;
 }
 #endif
@@ -296,6 +337,7 @@ void GuestAllocationsAdd_nid_postfix(void* mutation, void* pointer, std::size_t 
         require(previous.address + previous.bytes <= address, "overlapping guest allocation");
     }
     ranges.emplace(address, std::make_shared<const Range>(Range{address, bytes, readable, writable, address, bytes, true, gpu}));
+    noteRangesChanged(address, address + 1);
 }
 
 [[noreturn]] void PinnedFailure(std::uintptr_t address, std::size_t bytes, const char* why) {
@@ -319,15 +361,21 @@ void GuestAllocationsRequireUnpinned_nid_postfix(void* mutation, const void* poi
     const auto deadline = std::chrono::steady_clock::now() + pinWait();
     int syncedRounds = 0;
     for (;;) {
-        registry().readableLease.reset();
-        registry().allLease.reset();
+        ensureSnapshots();
+        const bool leasedAll = registry().allSnapshot.use_count() > 1;
+        const bool leasedReadable = registry().readableSnapshot.use_count() > 1;
+        const auto isPinned = [&](const std::shared_ptr<const Range>& range) {
+            if (range->bytes == 0) return range.use_count() != 1;
+            const long baseline = range->readable ? 3 : 2;
+            return range.use_count() > baseline || leasedAll || (leasedReadable && range->readable);
+        };
         bool pinned = false;
         auto it = ranges.upper_bound(address);
         if (it != ranges.begin()) --it;
         for (; it != ranges.end(); ++it) {
             const auto& [base, range] = *it;
             if (base >= end && base != address) break;
-            if (((address < base + range->bytes && base < end) || base == address) && range.use_count() != 1) {
+            if (((address < base + range->bytes && base < end) || base == address) && isPinned(range)) {
                 pinned = true;
                 break;
             }
@@ -431,9 +479,15 @@ void GuestAllocationsRemove_nid_postfix(void* mutation, const void* pointer) {
     const auto exact = ranges.find(range.address);
     if (exact != ranges.end() && exact->second->allocationBytes == exact->second->bytes) {
         ranges.erase(exact);
+        noteRangesChanged(range.address, range.address + 1);
         return;
     }
-    for (auto it = ranges.lower_bound(range.address); it != ranges.end() && it->second->allocationAddress == range.address;) it = ranges.erase(it);
+    std::uint64_t last = range.address;
+    for (auto it = ranges.lower_bound(range.address); it != ranges.end() && it->second->allocationAddress == range.address;) {
+        last = it->first;
+        it = ranges.erase(it);
+    }
+    noteRangesChanged(range.address, last + 1);
 }
 
 namespace {
@@ -475,8 +529,20 @@ RangePatch replaceRange(const void* pointer, std::size_t bytes, bool remove, boo
 
 void applyPatch(const RangePatch& patch) {
     auto& ranges = registry().ranges;
-    for (const auto key : patch.erased) ranges.erase(key);
-    for (const auto& [key, range] : patch.inserted) ranges.emplace(key, range);
+    if (patch.erased.empty() && patch.inserted.empty()) return;
+    std::uint64_t first = std::numeric_limits<std::uint64_t>::max();
+    std::uint64_t last = 0;
+    for (const auto key : patch.erased) {
+        ranges.erase(key);
+        first = std::min(first, key);
+        last = std::max(last, key);
+    }
+    for (const auto& [key, range] : patch.inserted) {
+        ranges.emplace(key, range);
+        first = std::min(first, key);
+        last = std::max(last, key);
+    }
+    noteRangesChanged(first, last + 1);
 }
 
 bool allocationRemains(const Range& range, const RangePatch& patch) {
@@ -535,13 +601,8 @@ void GuestAllocationsUnmap_nid_postfix(void* mutation, const void* pointer, std:
 
 Lease GuestAllocationsAcquire_nid_postfix() {
     std::lock_guard lock(registry().mutex);
-    if (auto shared = registry().readableLease.lock()) return Lease(std::move(shared));
-    auto ranges = std::make_shared<Lease::Ranges>();
-    for (const auto& [address, range] : registry().ranges) {
-        if (range->readable && range->bytes != 0) ranges->push_back(range);
-    }
-    registry().readableLease = ranges;
-    return Lease(std::move(ranges));
+    ensureSnapshots();
+    return Lease(registry().readableSnapshot);
 }
 
 std::shared_ptr<const Range> GuestAllocationsLookup_nid_postfix(std::uintptr_t address, bool next) {
@@ -562,14 +623,8 @@ std::shared_ptr<const Range> GuestAllocationsLookup_nid_postfix(std::uintptr_t a
 
 Lease GuestAllocationsAcquireAll_nid_postfix() {
     std::lock_guard lock(registry().mutex);
-    if (auto shared = registry().allLease.lock()) return Lease(std::move(shared));
-    auto ranges = std::make_shared<Lease::Ranges>();
-    ranges->reserve(registry().ranges.size());
-    for (const auto& [address, range] : registry().ranges) {
-        if (range->bytes != 0) ranges->push_back(range);
-    }
-    registry().allLease = ranges;
-    return Lease(std::move(ranges));
+    ensureSnapshots();
+    return Lease(registry().allSnapshot);
 }
 
 }

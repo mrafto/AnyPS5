@@ -2047,15 +2047,14 @@ bool ImportMappedRanges(const Context& context, const GuestAllocations::Mapped& 
 
 bool RegisteredReadableCovers(std::uint64_t address, std::size_t bytes) {
     if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return false;
-    const auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
-    return containingRange(lease, address, address + bytes) != nullptr;
+    const auto range = GuestAllocations::GuestAllocationsLookup_nid_postfix(address, false);
+    return range != nullptr && range->readable && address + bytes <= range->address + range->bytes;
 }
 
 std::uint64_t RegisteredReadableEnd(std::uint64_t address) {
     if (address == std::numeric_limits<std::uint64_t>::max()) return 0;
-    const auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
-    const auto* range = containingRange(lease, address, address + 1);
-    return range != nullptr ? range->address + range->bytes : 0;
+    const auto range = GuestAllocations::GuestAllocationsLookup_nid_postfix(address, false);
+    return range != nullptr && range->readable ? range->address + range->bytes : 0;
 }
 
 bool HostImportCovers(const Context& context, std::uint64_t address, std::size_t bytes) {
