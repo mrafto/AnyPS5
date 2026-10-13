@@ -36,10 +36,6 @@ struct Registry {
     std::map<std::uint64_t, std::shared_ptr<const Range>> ranges;
     bool mainImageRegistered = false;
     std::map<std::uintptr_t, std::uintptr_t> registeredImages;
-    // The snapshots leases share: every non-empty range, and the readable ones, in address order. They are
-    // patched in place as the map changes (copied first while a lease holds one), so a lease costs a pointer
-    // copy rather than a walk of every range. Each holds one reference to its ranges besides the map's, which
-    // isPinned() accounts for. Rebuilt whole when dirty (image registration changes many ranges at once).
     std::shared_ptr<Lease::Ranges> allSnapshot;
     std::shared_ptr<Lease::Ranges> readableSnapshot;
     bool snapshotsDirty = true;
@@ -99,7 +95,6 @@ void resyncSnapshot(std::shared_ptr<Lease::Ranges>& snapshot, std::uint64_t firs
     snapshot->insert(snapshot->begin() + index, replacement.begin(), replacement.end());
 }
 
-// The map changed within [first, last): bring the snapshots in line with it.
 void noteRangesChanged(std::uint64_t first, std::uint64_t last) {
     auto& state = registry();
     if (state.snapshotsDirty) return;
@@ -367,8 +362,6 @@ void GuestAllocationsRequireUnpinned_nid_postfix(void* mutation, const void* poi
     int syncedRounds = 0;
     for (;;) {
         ensureSnapshots();
-        // Leases share the snapshots, so a leased snapshot pins every range in it; a range held through a
-        // retired snapshot or a pointer of its own shows in its count instead.
         const bool leasedAll = registry().allSnapshot.use_count() > 1;
         const bool leasedReadable = registry().readableSnapshot.use_count() > 1;
         const auto isPinned = [&](const std::shared_ptr<const Range>& range) {

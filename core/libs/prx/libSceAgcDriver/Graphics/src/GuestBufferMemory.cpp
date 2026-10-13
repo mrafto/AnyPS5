@@ -2047,7 +2047,6 @@ bool ImportMappedRanges(const Context& context, const GuestAllocations::Mapped& 
 
 bool RegisteredReadableCovers(std::uint64_t address, std::size_t bytes) {
     if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return false;
-    // A point query: look the range up instead of leasing a snapshot of every registered range.
     const auto range = GuestAllocations::GuestAllocationsLookup_nid_postfix(address, false);
     return range != nullptr && range->readable && address + bytes <= range->address + range->bytes;
 }

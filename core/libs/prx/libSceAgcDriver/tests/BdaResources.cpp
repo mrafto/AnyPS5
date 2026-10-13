@@ -147,7 +147,6 @@ void failedImportRemapTests(const Context& context, const BdaTestAccess& access)
         access.limitMemory(0);
         const auto attempts = access.allocationAttempts();
         Require(HostImportFor(importing, address, 2 * piece) == nullptr && access.allocationAttempts() == attempts + 1, "host import failure was not exercised");
-        // The registry holds its range in the map and in its two lease snapshots.
         Require(owner.use_count() == 3, "a failed import pins its owner");
         Require(HostImportFor(importing, address, 2 * piece) == nullptr && access.allocationAttempts() == attempts + 1, "an unchanged failed import was retried");
         add(3);

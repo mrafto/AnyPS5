@@ -44,7 +44,6 @@ void leaseSnapshotTests() {
         const auto found = std::find_if(first.begin(), first.end(), [&](const auto& range) { return range->address == address; });
         Require(found != first.end(), "the shared snapshot misses a registered range");
         held = *found;
-        // The registry itself holds the range in its map and in its two snapshots; leases share a snapshot.
         Require(held.use_count() == 3, "the shared snapshot of two leases holds a range more than once");
         {
             GuestAllocations::Mutation mutation;
