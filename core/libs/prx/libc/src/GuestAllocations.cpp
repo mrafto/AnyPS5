@@ -357,7 +357,11 @@ void GuestAllocationsRequireUnpinned_nid_postfix(void* mutation, const void* poi
 void GuestAllocationsRequireAvailable_nid_postfix(void*, const void* pointer, std::size_t bytes) {
     const auto address = reinterpret_cast<std::uintptr_t>(pointer);
     require(address != 0 && bytes != 0 && bytes <= std::numeric_limits<std::uint64_t>::max() - address, "invalid fixed guest mapping");
-    for (const auto& [base, range] : registry().ranges) {
+    const auto& ranges = registry().ranges;
+    auto it = ranges.upper_bound(address);
+    if (it != ranges.begin()) --it;
+    for (; it != ranges.end(); ++it) {
+        const auto& [base, range] = *it;
         if (base >= address + bytes) break;
         if (base + range->bytes > address) {
             char message[160];
@@ -370,7 +374,12 @@ void GuestAllocationsRequireAvailable_nid_postfix(void*, const void* pointer, st
 bool GuestAllocationsOverlaps_nid_postfix(void*, const void* pointer, std::size_t bytes) {
     const auto address = reinterpret_cast<std::uintptr_t>(pointer);
     require(address != 0 && bytes != 0 && bytes <= std::numeric_limits<std::uint64_t>::max() - address, "invalid guest allocation range");
-    for (const auto& [base, range] : registry().ranges) {
+    // Registered ranges are disjoint, so only the last one starting at or before the address can reach into it.
+    const auto& ranges = registry().ranges;
+    auto it = ranges.upper_bound(address);
+    if (it != ranges.begin()) --it;
+    for (; it != ranges.end(); ++it) {
+        const auto& [base, range] = *it;
         if (base >= address + bytes) break;
         if (base + range->bytes > address) return true;
     }
@@ -404,11 +413,12 @@ Range GuestAllocationsFind_nid_postfix(void*, const void* pointer) {
         require(range.releasable, "guest image memory is not a releasable allocation");
         return {address, range.allocationBytes, range.readable, range.writable, address, range.allocationBytes, range.releasable, range.gpu};
     }
-    for (const auto& [base, range] : registry().ranges) {
-        if (range->allocationAddress == address) {
-            require(range->releasable, "guest image memory is not a releasable allocation");
-            return {address, range->allocationBytes, range->readable, range->writable, address, range->allocationBytes, range->releasable, range->gpu};
-        }
+    // Allocations are disjoint, so the first piece of one that starts at the address is the first range at or after it.
+    const auto first = registry().ranges.lower_bound(address);
+    if (first != registry().ranges.end() && first->second->allocationAddress == address) {
+        const auto& range = *first->second;
+        require(range.releasable, "guest image memory is not a releasable allocation");
+        return {address, range.allocationBytes, range.readable, range.writable, address, range.allocationBytes, range.releasable, range.gpu};
     }
     throw std::runtime_error("guest allocation is not registered");
 }
@@ -423,7 +433,7 @@ void GuestAllocationsRemove_nid_postfix(void* mutation, const void* pointer) {
         ranges.erase(exact);
         return;
     }
-    std::erase_if(ranges, [&](const auto& entry) { return entry.second->allocationAddress == range.address; });
+    for (auto it = ranges.lower_bound(range.address); it != ranges.end() && it->second->allocationAddress == range.address;) it = ranges.erase(it);
 }
 
 namespace {
