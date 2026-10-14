@@ -113,6 +113,8 @@ struct ShaderTessellationInputInfo {
     std::uint32_t partitioning = 0;
     std::uint32_t outputTopology = 0;
     std::uint32_t patchesPerGroup = 256;
+    std::uint32_t primitiveGroupSize = 0;
+    bool breakAtInstance = false;
 };
 
 struct ShaderVertexInputInfo {
@@ -175,6 +177,7 @@ struct ShaderPixelInputInfo {
     ConservativeZExport psConservativeZExport = ConservativeZExport::AnyZ;
     bool psOrderedPixelShader = false;
     bool psAlphaToCoverage = false;
+    bool psDitheredAlphaToCoverage = false;
     ShaderStageRuntime stage;
 
     bool HasPositionInput() const {

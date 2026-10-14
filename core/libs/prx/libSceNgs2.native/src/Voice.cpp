@@ -116,6 +116,10 @@ static void Patch(Ngs2Voice& voice, const Ngs2VoicePatchParam& patch) {
         return;
     }
     auto* dest = Ngs2FindVoice(patch.dest_handle);
+    if (dest == nullptr) {
+        auto* rack = Ngs2FindRack(patch.dest_handle);
+        if (rack != nullptr && !rack->voices.empty()) dest = &rack->voices.front();
+    }
     if (dest == nullptr || dest->rack->system != voice.rack->system || dest->rack->rackId == SCE_NGS2_RACK_ID_SAMPLER ||
         dest->rack->rackId == SCE_NGS2_RACK_ID_CUSTOM_SAMPLER) {
         APS5_INVALID_ARG_EX;
@@ -450,6 +454,14 @@ int APS5_VABI sceNgs2VoiceGetState(uintptr_t voice_handle, Ngs2VoiceState* state
             auto& submixer = *reinterpret_cast<Ngs2SubmixerVoiceState*>(state);
             submixer = {};
             submixer.voice_state.state_flags = voice.stateFlags;
+            return SCE_NGS2_OK;
+        }
+        case SCE_NGS2_RACK_ID_CUSTOM_SAMPLER: {
+            if (state_size != sizeof(Ngs2CustomSamplerVoiceState)) return SCE_NGS2_ERROR_INVALID_OUT_SIZE;
+            auto& sampler = *reinterpret_cast<Ngs2CustomSamplerVoiceState*>(state);
+            sampler = {};
+            sampler.voice_state.state_flags = voice.stateFlags;
+            sampler.num_decoded_samples = voice.decodedSamples;
             return SCE_NGS2_OK;
         }
         default: throw std::runtime_error("NGS2: voice state of rack " + Ngs2Hex(voice.rack->rackId) + " is not implemented");
