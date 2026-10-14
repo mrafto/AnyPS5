@@ -1,5 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
@@ -25,6 +27,14 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+namespace AgcDriver {
+
+struct VulkanDeviceTestAccess {
+    static Graphics::Context ContextOf(const VulkanDevice& device) { return device.graphicsContext(); }
+};
+
+}
 
 namespace {
 
@@ -303,6 +313,13 @@ void DepthBitsArrayCase(AgcDriver::VulkanDevice& device, GuestBlock& block, std:
 
 // A 2D shader image over a 2D-array T# reads the array's first slice: a one-slice array, which samples the depth
 // image itself, and a 3-slice array, which samples the plane copy.
+void DepthBitsBaseSliceCase(AgcDriver::VulkanDevice& device, GuestBlock& block, std::span<std::uint32_t> output) {
+    Shape shape{Format16Uint, 256, 128, Type2DArray, 1, Swizzle64KbZX};
+    shape.baseArray = 1;
+    Load(device, block.At(DepthBitsOffset), shape, 0, output);
+    Expect(output, 0x1234u, "D16 depth-bits array from base slice 1");
+}
+
 void FirstSliceCase(AgcDriver::VulkanDevice& device, GuestBlock& block, std::span<std::uint32_t> output) {
     auto* one = block.At(OneSliceOffset);
     DrawDepth(device, reinterpret_cast<std::uintptr_t>(one), {128, 128}, VK_FORMAT_D32_SFLOAT, DrawnDepth);
@@ -316,20 +333,36 @@ void FirstSliceCase(AgcDriver::VulkanDevice& device, GuestBlock& block, std::spa
     Expect(output, Bits(DrawnDepth), "3-slice D32 2D array through a 2D shader image");
 }
 
-// A plane array from a later base slice is still refused (its slice offsets are not modeled here).
-void RefusalCase(AgcDriver::VulkanDevice& device, GuestBlock& block, std::span<std::uint32_t> output) {
-    bool refused = false;
-    try {
-        Shape shape{Format32Float, 128, 128, Type2DArray, 2, Swizzle64KbZX};
-        shape.baseArray = 1;
-        Load(device, block.At(ArrayOffset), shape, 0, output);
-    } catch (const std::runtime_error& error) {
-        refused = std::string(error.what()).find("sampling the depth planes of depth surface") != std::string::npos;
-        if (!refused) throw;
-    }
-    Require(refused, "a depth plane array from base slice 1 was not refused");
+void BaseSliceCase(AgcDriver::VulkanDevice& device, GuestBlock& block, std::span<std::uint32_t> output) {
+    auto* base = block.At(ArrayOffset);
+    Shape shape{Format32Float, 128, 128, Type2DArray, 2, Swizzle64KbZX};
+    shape.baseArray = 1;
+    Load(device, base, shape, 0, output);
+    Expect(output, Bits(0.5f), "D32 2D array from base slice 1, slice 0");
+    Load(device, base, shape, 1, output);
+    Expect(output, Bits(0.75f), "D32 2D array from base slice 1, slice 1");
+    Load(device, base, shape, 0, output, true);
+    Expect(output, Bits(0.5f), "D32 2D array from base slice 1 through a 2D shader image");
 }
 
+void ExpectRefusal(AgcDriver::VulkanDevice& device, GuestBlock& block, std::size_t offset, const Shape& shape, std::uint32_t baseArray, const std::string& expected, const std::string& what) {
+    const auto words = TextureDescriptor(block.At(offset), shape);
+    auto resource = AgcDriver::Graphics::DecodeTextureResource(words);
+    resource.baseArray = baseArray;
+    try {
+        static_cast<void>(AgcDriver::Graphics::DepthSurfaceTexture(AgcDriver::VulkanDeviceTestAccess::ContextOf(device), words, resource, {}));
+    } catch (const std::runtime_error& error) {
+        Require(std::string(error.what()).find(expected) != std::string::npos, what + " was refused with an unexpected message: " + error.what());
+        return;
+    }
+    Require(false, what + " was not refused");
+}
+
+void RefusalCase(AgcDriver::VulkanDevice& device, GuestBlock& block) {
+    ExpectRefusal(device, block, ArrayOffset, {Format32Float, 128, 128, Type2DArray, 2, Swizzle64KbZX}, 3, "base slice 3 is not implemented", "a depth plane array whose base slice is past its last slice");
+    ExpectRefusal(device, block, CubeOffset, {Format32Float, 128, 128, TypeCube, 5, Swizzle64KbZX}, 1, "base slice 1 is not implemented", "a depth plane cube from base slice 1");
+    ExpectRefusal(device, block, ArrayOffset, {Format32Float, 128, 128, Type2D, 0, Swizzle64KbZX}, 1, "slice 1 is not implemented", "a 2D depth plane view with a base slice");
+}
 }
 
 int main() {
@@ -342,8 +375,10 @@ int main() {
         CubeCase(*device, block, output);
         IntegerCase(*device, block, output);
         DepthBitsArrayCase(*device, block, output);
+        DepthBitsBaseSliceCase(*device, block, output);
         FirstSliceCase(*device, block, output);
-        RefusalCase(*device, block, output);
+        BaseSliceCase(*device, block, output);
+        RefusalCase(*device, block);
         std::puts("depth plane sampling tests passed");
         return 0;
     } catch (const std::exception& error) {

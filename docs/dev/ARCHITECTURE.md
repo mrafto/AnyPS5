@@ -43,7 +43,7 @@ flowchart LR
 ```
 
 - [`core/relinker/main.cpp`](../../core/relinker/main.cpp) runs the steps in this order. `--to-intel` is optional, see [USAGE.md](../user/USAGE.md).
-- Each library in [`core/libs/prx`](../../core/libs/prx) builds as a shared library. After the build, `nid_patcher` ([`core/libs/nid`](../../core/libs/nid)) renames every export to its NID, computed from the function name. `APS5_EXPORT("<nid>", func)` sets the NID directly when the name is unknown.
+- Each library in [`core/libs/prx`](../../core/libs/prx) builds as a shared library. After the build, `nid_patcher` ([`core/libs/nid`](../../core/libs/nid)) renames every export to its NID, computed from the function name. `APS5_EXPORT("<nid>", func)` sets the NID directly when the name is unknown. Every other library keeps the names libc exports; it reads them from `libc.exports`, which `nid_patcher --write-export-list` rewrites only when that list changes. On Windows the link writes each import library with `SOURCE_DATE_EPOCH=0` and `ranlib -D` and replaces it only when its bytes change. A source edit that keeps the exports therefore relinks and re-patches only its own library.
 
 ## Windows deferred module initialization
 
