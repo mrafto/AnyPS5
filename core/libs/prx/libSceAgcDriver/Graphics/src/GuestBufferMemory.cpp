@@ -1175,6 +1175,7 @@ struct ImageMirrors {
     VkDevice device = VK_NULL_HANDLE;
     std::map<std::uint64_t, std::shared_ptr<ImageMirror>> entries;
     std::set<std::uint64_t> failed;
+    std::set<std::uint64_t> unmappable;
     std::uint64_t heapBytes = 0;
     // APS5_PROFILE_DRAW counters, reported every 10 s as [buffers] image mirrors.
     std::uint64_t builds = 0;
@@ -1643,6 +1644,7 @@ std::shared_ptr<ImageMirror> acquireMirror(const Context& context, const std::sh
         if (state.device != context.device) {
             state.entries.clear();
             state.failed.clear();
+            state.unmappable.clear();
             state.heapBytes = 0;
             state.device = context.device;
             ++state.version;
@@ -1697,7 +1699,15 @@ std::shared_ptr<ImageMirror> acquireMirror(const Context& context, const std::sh
     try {
         mirror->buffer = std::make_shared<Buffer>(context, static_cast<std::size_t>(mirror->bytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
     } catch (const std::runtime_error& error) {
-        if (heap) throw std::runtime_error(heapMirrorError(*range, heapMirrorsBeside(*range), error.what()));
+        if (heap) {
+            // A heap the device cannot hold is left out of the table, not fatal: only a shader that reads it fails,
+            // with the address it read (BDA access failed), instead of every build aborting up front.
+            std::fprintf(stderr, "[gpu] %s; the range is left unmapped for shaders\n", heapMirrorError(*range, heapMirrorsBeside(*range), error.what()).c_str());
+            std::lock_guard lock(state.mutex);
+            state.failed.insert(range->address);
+            state.unmappable.insert(range->address);
+            return nullptr;
+        }
         std::fprintf(stderr, "[gpu] image mirror of 0x%llx+0x%llx failed: %s; falling back to copies\n", static_cast<unsigned long long>(range->address), static_cast<unsigned long long>(range->bytes), error.what());
         std::lock_guard lock(state.mutex);
         state.failed.insert(range->address);
@@ -1729,6 +1739,12 @@ std::shared_ptr<ImageMirror> acquireMirror(const Context& context, const std::sh
     state.entries[range->address] = mirror;
     ++state.version;
     return mirror;
+}
+
+bool mirrorUnmappable(std::uint64_t address) {
+    auto& state = Mirrors();
+    std::lock_guard lock(state.mutex);
+    return state.unmappable.contains(address);
 }
 
 std::shared_ptr<ImageMirror> findMirror(const Context& context, std::uint64_t begin, std::uint64_t end) {
@@ -2084,6 +2100,7 @@ void ClearImageMirrors(VkDevice device) {
         if (state.device != device) return;
         entries.swap(state.entries);
         state.failed.clear();
+        state.unmappable.clear();
         state.heapBytes = 0;
         state.device = VK_NULL_HANDLE;
     }
@@ -2505,6 +2522,10 @@ void GuestBufferMemory::AcquireRegistered() {
         // The import lock is taken per range: a mirror's preparation may wait for recorded work, which
         // must not happen under it.
         regions.reserve(lease.size());
+        static const std::uint64_t copyLimit = [] {
+            const char* value = std::getenv("APS5_ADDRESS_COPY_MAX_MIB");
+            return (value ? std::strtoull(value, nullptr, 10) : 64ull) << 20u;
+        }();
         std::vector<AddressCopy> copies;
         std::vector<std::uint64_t> imported;
         for (const auto& range : lease) {
@@ -2541,6 +2562,13 @@ void GuestBufferMemory::AcquireRegistered() {
                     continue;
                 }
             }
+            if (range->bytes > copyLimit && (mirrorUnmappable(range->address) || !GuestMemory::Accessible(reinterpret_cast<const void*>(range->address), range->bytes, false))) {
+                // Neither imported, mirrored nor copyable within the limit: left out of the table, so only a shader
+                // that reads it fails (BDA access failed, with the address), not every build.
+                static std::atomic<unsigned> reported{0};
+                if (reported.fetch_add(1) < 16) std::fprintf(stderr, "[gpu] registered range 0x%llx+0x%llx cannot be imported, mirrored or copied (%llu MiB copy limit, APS5_ADDRESS_COPY_MAX_MIB); it is left unmapped for shaders\n", static_cast<unsigned long long>(range->address), static_cast<unsigned long long>(range->bytes), static_cast<unsigned long long>(copyLimit >> 20u));
+                continue;
+            }
             addCopiedRange({range->address, range->address + range->bytes, range->writable});
             const auto& copied = regions.back();
             std::uint64_t committed = copied.end - copied.begin;
@@ -2553,10 +2581,6 @@ void GuestBufferMemory::AcquireRegistered() {
         }
         releaseImportedMirrors(context, imported);
         regionsSorted = sortedLookup;
-        static const std::uint64_t copyLimit = [] {
-            const char* value = std::getenv("APS5_ADDRESS_COPY_MAX_MIB");
-            return (value ? std::strtoull(value, nullptr, 10) : 64ull) << 20u;
-        }();
         if (const auto overflow = AddressCopyOverflow(std::move(copies), copyLimit); !overflow.empty()) {
             std::fprintf(stderr, "FATAL: %s\n", overflow.c_str());
             std::fflush(stderr);
