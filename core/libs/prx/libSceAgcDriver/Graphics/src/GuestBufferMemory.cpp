@@ -1953,7 +1953,7 @@ std::shared_ptr<ImageMirror> acquireMirror(const Context& context, const std::sh
     return mirror;
 }
 
-// Registered ranges of at least APS5_LAZY_RANGE_MIB (default 1024; 0 turns it off) stay out of the BDA table until a
+// Registered ranges of at least APS5_LAZY_RANGE_MIB (off by default: 0; Windows host imports now stay write-watched, so mapping big heaps whole is cheaper than the descriptor copies a deferred heap forces) stay out of the BDA table until a
 // shader first reads one: a title registers heaps larger than the driver can pin or the device can mirror, most of
 // which no shader touches. The first read faults once (the dispatch's result is lost, as for any unmapped address),
 // then the range is mapped like any other.
@@ -1971,7 +1971,7 @@ LazyRanges& Lazy() {
 std::uint64_t lazyRangeBytes() {
     static const std::uint64_t bytes = [] {
         const char* value = std::getenv("APS5_LAZY_RANGE_MIB");
-        return (value != nullptr ? std::strtoull(value, nullptr, 10) : 1024ull) << 20u;
+        return (value != nullptr ? std::strtoull(value, nullptr, 10) : 0ull) << 20u;
     }();
     return bytes;
 }
@@ -3678,7 +3678,7 @@ void GuestBufferMemory::completeSpaceWrites() const {
         OverlappedRanges(std::span<const Region>(base), next, writes, candidates);
         next = base.size();
         for (const auto index : candidates) {
-            if (!CompletePendingCpuWrites(context, base[index].begin, static_cast<std::size_t>(base[index].end - base[index].begin))) continue;
+            if (!CompletePendingCpuWrites(context, base[index].begin, static_cast<std::size_t>(base[index].end - base[index].begin), !base[index].writable)) continue;
             next = index + 1;
             break;
         }
@@ -3689,7 +3689,7 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
     Require(prepared && !uploaded, "guest memory upload was not prepared");
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto started = std::chrono::steady_clock::now();
-    for (const auto& region : regions) CompletePendingCpuWrites(context, region.begin, static_cast<std::size_t>(region.end - region.begin));
+    for (const auto& region : regions) CompletePendingCpuWrites(context, region.begin, static_cast<std::size_t>(region.end - region.begin), !region.writable);
     if (space != nullptr) completeSpaceWrites();
     uploaded = true;
     for (const auto& [begin, end] : writes) StorageTexture::FlushPending(begin, static_cast<std::size_t>(end - begin), nullptr, "written buffer range");

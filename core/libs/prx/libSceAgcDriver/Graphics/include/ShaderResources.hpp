@@ -41,7 +41,10 @@ TextureCacheUse TextureCacheUsage();
 std::uint64_t SampledTextureCacheBudget(const Context& context);
 std::shared_ptr<Texture> CachedSampledTexture(const Context& context, std::span<const std::uint32_t> words);
 bool SampledTexturesShareEntry(std::span<const std::uint32_t> first, std::span<const std::uint32_t> second);
-bool CompletePendingCpuWrites(const Context& context, std::uint64_t address, std::size_t bytes);
+// `readOnly`: the caller's GPU work only reads the range in place. A label stored at a completion is
+// also recorded on the GPU ahead of that work (VulkanDevice::WriteLabelOnGpu), so such a reader is
+// ordered behind it without waiting; only a copied writer's pending write-back makes it wait.
+bool CompletePendingCpuWrites(const Context& context, std::uint64_t address, std::size_t bytes, bool readOnly = false);
 
 // The cached storage image of a surface (render targets use it as their resident image); brought up
 // to date with guest memory before it is returned.
@@ -548,6 +551,8 @@ private:
     };
     std::vector<SamplerSource> samplerSources;
     bool reusable = false;
+    // The set holds a texture remade on every use: its proofs repeat the lookups (see noteReusable).
+    bool perUseTextures = false;
     std::vector<DirectRegion> directRegions;
     std::vector<ValidatedSurface> validatedTextures;
     // The pending registry's serial at the last Revalidate that proved this object, taken before
