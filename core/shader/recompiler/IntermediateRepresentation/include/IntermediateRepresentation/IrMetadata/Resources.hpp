@@ -88,8 +88,11 @@ struct ImageResource {
     bool depthBitsCompatible = true;
     bool constantSwizzle = false;
     bool constantSwizzleCompatible = true;
+    bool cubeFaceCompatible = true;
     bool flatVolumeCompatible = true;
+    bool singleMipPlaneBiasCompatible = false;
     bool flatLineCompatible = true;
+    bool flatVolumeLineCompatible = true;
     bool foldTexelOffsetsOnly = false;
     std::uint32_t byElements = 0;
     std::uint32_t byComponents = 0;

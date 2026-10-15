@@ -32,7 +32,10 @@ RULES = {
 CPP = {".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx", ".inl", ".ipp"}
 IMAGES = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".svg", ".webp", ".ico", ".tga", ".dds"}
 NOTES = {".md", ".markdown", ".rst", ".log", ".patch", ".diff"}
-AGENT_FILES = {"agents.md", "claude.md", "gemini.md", ".cursorrules", "copilot-instructions.md"}
+AGENT_FILES = {
+    "agents.md", "claude.md", "gemini.md", ".cursorrules", "copilot-instructions.md",
+    ".windsurfrules", "windsurf.md", "chatgpt.md", ".chatgptrules", ".aider.conf.yml",
+}
 DEBT = "docs/dev/TechnicalDebt.md"
 DEBT_DIR = "docs/dev/debt/"
 DEBT_TARGET = re.compile(r"\]\((?:\.\./)+(core/[^)#\s]+)")
@@ -73,17 +76,23 @@ class Check:
         self.blobs = {}
         self.tree = set(self.modes)
         self.dirs = {str(parent) for path in self.tree for parent in PurePosixPath(path).parents}
-        statuses = git("diff", "--name-status", "--no-renames", "-z", self.base, head).split("\0")
-        for status, path in zip(statuses[::2], statuses[1::2]):
-            self.status[path] = status
-        for line in git("diff", "--numstat", "--no-renames", "-z", self.base, head).split("\0"):
-            if not line:
-                continue
+        diff = ("--find-renames", "-l0", self.base, head)
+        statuses = iter(git("diff", "--name-status", "-z", *diff).split("\0")[:-1])
+        for status in statuses:
+            path = next(statuses)
+            if status.startswith("R"):
+                path = next(statuses)
+            self.status[path] = status[0]
+        statistics = iter(git("diff", "--numstat", "-z", *diff).split("\0")[:-1])
+        for line in statistics:
             added, deleted, path = line.split("\t", 2)
+            if not path:
+                next(statistics)
+                path = next(statistics)
             self.numstat[path] = (added, deleted)
-        paths = iter(self.status)
+        paths = iter([path for path, status in self.status.items() for _ in range(2 if status == "T" else 1)])
         path, number = None, None
-        for line in git("diff", "-U0", "--no-color", "--no-renames", self.base, head).split("\n"):
+        for line in git("diff", "-U0", "--no-color", *diff).split("\n"):
             if line.startswith("diff --git "):
                 path, number = next(paths), None
             elif line.startswith("@@"):
@@ -151,7 +160,8 @@ class Check:
         self.duplicates(exports)
         for path, lines in self.files(lambda p: p.suffix in (".py", ".cmake") or p.name == "CMakeLists.txt"):
             for number, text in lines:
-                if "#" in STRINGS.sub('""', text) and not text.startswith("#!"):
+                shebang = text.startswith("#!") or (number == 1 and text.startswith("\ufeff#!"))
+                if "#" in STRINGS.sub('""', text) and not shebang:
                     self.report("comment", path, number)
         if any(is_debt(path) for path in self.status):
             self.findings = [finding for finding in self.findings if finding[0] != "comment"]
@@ -181,6 +191,16 @@ class Check:
             if match and not match.group(1).startswith("3rdparty/"):
                 self.report("system-dependency", ".gitmodules", number, match.group(1))
 
+    def shaders(self):
+        if any(is_debt(path) for path in self.status):
+            return
+        for path, lines in self.files(lambda p: p.suffix in (".comp", ".frag", ".vert", ".glsl")):
+            masked = cpp_text(self.show(path), preserve_comments=True).split("\n")
+            for number, _ in lines:
+                bare = masked[number - 1]
+                if ("//" in bare or "/*" in bare) and not ALLOWED_COMMENT.match(bare):
+                    self.report("comment", path, number)
+
     def submodules(self):
         result = subprocess.run(["git", "config", "--no-includes", "-z", "--blob", f"{self.head}:.gitmodules", "--list"],
                                 capture_output=True, encoding="utf-8", errors="replace")
@@ -202,11 +222,15 @@ class Check:
             suffix = PurePosixPath(path).suffix.lower()
             if self.status.get(path) != "D" and (added == "-" or suffix in IMAGES or not utf8(self.blob(path))):
                 self.report("binary", path, 0)
-            if self.status.get(path) == "A" and allowed_notes(path) is False:
+            if self.status.get(path) in ("A", "R") and allowed_notes(path) is False:
                 self.report("notes-file", path, 0)
 
     def docs(self):
-        for path, lines in self.files(lambda p: p.suffix == ".md"):
+        files = dict(self.files(lambda p: p.suffix == ".md"))
+        for path, status in self.status.items():
+            if status == "R" and not path.startswith("3rdparty/") and PurePosixPath(path).suffix == ".md":
+                files[path] = list(enumerate(self.show(path).split("\n"), 1))
+        for path, lines in files.items():
             fenced = fenced_lines(self.show(path))
             for number, text in lines:
                 name = debt_name(text) if is_debt(path) and text.startswith("- ") else None
@@ -251,7 +275,7 @@ class Check:
             self.report("pr-template", "", 0, f"unchecked: {item.strip()}")
         if checklist and not re.search(r"AI-assisted:\s*(yes|no)\b", checklist, re.I):
             self.report("pr-template", "", 0, "answer AI-assisted with yes or no")
-        if checklist and not re.search(r"Depends on:\s*(#\d+|none)\b", checklist, re.I):
+        if checklist and not re.search(r"Depends on:\s*(?:[-*+]\s+)?(#\d+|none)\b", checklist, re.I):
             self.report("pr-template", "", 0, "fill Depends on with #N or none")
 
 
@@ -442,6 +466,7 @@ if __name__ == "__main__":
     check = Check(args.base, args.head)
     check.code()
     check.build()
+    check.shaders()
     check.repository()
     check.docs()
     check.workflows()

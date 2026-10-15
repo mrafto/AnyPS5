@@ -20,6 +20,9 @@
 #else
 #include <unistd.h>
 #endif
+#ifdef __linux__
+#include <sys/inotify.h>
+#endif
 extern "C" {
 int APS5_VABI remove_nid_postfix(const char*);
 int APS5_VABI rename_nid_postfix(const char*, const char*);
@@ -246,10 +249,50 @@ static void TestRelinkedModuleNameCase() {
     std::filesystem::remove_all(root);
 }
 
+#ifdef __linux__
+static int DirectoryOpens(int watch) {
+    alignas(inotify_event) char buffer[4096];
+    int opens = 0;
+    for (ssize_t size; (size = read(watch, buffer, sizeof buffer)) > 0;) {
+        for (char* event = buffer; event < buffer + size; event += sizeof(inotify_event) + reinterpret_cast<inotify_event*>(event)->len)
+            if (reinterpret_cast<inotify_event*>(event)->mask & IN_OPEN) ++opens;
+    }
+    return opens;
+}
+
+static void TestMissingPathListsDirectoryOnce() {
+    const auto root = std::filesystem::path("anyps5-missing-listing-" +
+        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    Require(std::filesystem::create_directories(root));
+    { std::ofstream file(root / "present.txt"); file << "present"; }
+    const int watch = inotify_init1(IN_NONBLOCK);
+    Require(watch >= 0 && inotify_add_watch(watch, root.c_str(), IN_OPEN | IN_CLOSE_NOWRITE) >= 0);
+    const auto missing = (root / "Missing.txt").generic_string();
+    FileStat status{};
+    Require(sceKernelStat(missing.c_str(), &status) == static_cast<int>(0x80020002u) && DirectoryOpens(watch) == 1);
+    Require(sceKernelCheckReachability(missing.c_str()) == static_cast<int>(0x80020002u) && DirectoryOpens(watch) == 1);
+    Require(sceKernelOpen(missing.c_str(), 0, 0) == static_cast<int>(0x80020002u) && DirectoryOpens(watch) == 1);
+    close(watch);
+    { std::ofstream file(root / "plugin.prx.guest.prx"); file << "lower"; }
+    { std::ofstream file(root / "Plugin.prx.guest.prx"); file << "upper"; }
+    bool ambiguous = false;
+    try {
+        sceKernelStat((root / "PLUGIN.prx").generic_string().c_str(), &status);
+    } catch (const std::runtime_error&) {
+        ambiguous = true;
+    }
+    Require(ambiguous);
+    std::filesystem::remove_all(root);
+}
+#endif
+
 int main() {
     TestParentTraversal();
     TestRelinkedModuleNames();
     TestRelinkedModuleNameCase();
+#ifdef __linux__
+    TestMissingPathListsDirectoryOnce();
+#endif
     Require(chmod_nid_postfix(nullptr, 0600) == -1 && *__error_nid_postfix() == 14);
     Require(sceKernelChmod_nid_postfix(nullptr, 0600) == static_cast<int>(0x8002000eu));
     Require(chmod_nid_postfix("", 0600) == -1 && *__error_nid_postfix() == 2);
@@ -651,9 +694,25 @@ int main() {
         Require(std::filesystem::create_directory(targetDirectory));
         const auto directoryLink = root / "directory-link";
         const auto danglingLink = root / "dangling-link";
+        const auto absoluteLink = root / "absolute-link";
         Require(CreateSymbolicLinkW(directoryLink.c_str(), L"target-directory",
             SYMBOLIC_LINK_FLAG_DIRECTORY | SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE) != 0);
-        Require(CreateSymbolicLinkW(danglingLink.c_str(), missing.c_str(), SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE) != 0);
+        Require(CreateSymbolicLinkW(danglingLink.c_str(), L"missing.txt", SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE) != 0);
+        Require(CreateSymbolicLinkW(absoluteLink.c_str(), std::filesystem::absolute(present).c_str(),
+            SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE) != 0);
+        const auto checkRelativeLink = [](const std::filesystem::path& link, std::int64_t targetLength) {
+            FileStat own{};
+            return lstat_nid_postfix(link.string().c_str(), &own) == 0 && (own.st_mode & 0170000) == 0120000 &&
+                own.st_size == targetLength && own.st_nlink == 1;
+        };
+        Require(checkRelativeLink(fileLink, 11));
+        Require(checkRelativeLink(directoryLink, 16));
+        Require(checkRelativeLink(danglingLink, 11));
+        FileStat followed{};
+        Require(lstat_nid_postfix(fileLink.string().c_str(), &linkStatus) == 0);
+        Require(stat_nid_postfix(fileLink.string().c_str(), &followed) == 0 && (followed.st_mode & 0170000) == 0100000);
+        Require(followed.st_ino == status.st_ino && linkStatus.st_ino != status.st_ino && linkStatus.st_dev == status.st_dev);
+        Require(stat_nid_postfix(directoryLink.string().c_str(), &followed) == 0 && (followed.st_mode & 0170000) == 0040000);
         const auto checkUnsupportedLink = [](const std::filesystem::path& link) {
             FileStat untouched;
             std::memset(&untouched, 0x5a, sizeof(untouched));
@@ -663,7 +722,7 @@ int main() {
             try {
                 lstat_nid_postfix(link.string().c_str(), &untouched);
             } catch (const std::runtime_error& error) {
-                rejected = std::strcmp(error.what(), "lstat of a Windows symbolic link not implemented") == 0;
+                rejected = std::strcmp(error.what(), "lstat of a Windows reparse point other than a relative symbolic link not implemented") == 0;
             }
             const bool errorUnchanged = *__error_nid_postfix() == sentinelError;
             const auto* bytes = reinterpret_cast<const unsigned char*>(&untouched);
@@ -671,11 +730,9 @@ int main() {
             return rejected && errorUnchanged && statusUnchanged;
         };
         Require(stat_nid_postfix(fileLink.string().c_str(), &status) == 0 && status.st_size == 5);
-        Require(checkUnsupportedLink(fileLink));
-        Require(checkUnsupportedLink(directoryLink));
-        Require(checkUnsupportedLink(danglingLink));
-        Require(std::filesystem::remove(fileLink) && std::filesystem::remove(directoryLink) &&
-            std::filesystem::remove(danglingLink) && std::filesystem::remove(targetDirectory));
+        Require(checkUnsupportedLink(absoluteLink));
+        Require(std::filesystem::remove(fileLink) && std::filesystem::remove(directoryLink) && DeleteFileW(danglingLink.c_str()) != 0 &&
+            std::filesystem::remove(absoluteLink) && std::filesystem::remove(targetDirectory));
     }
 #endif
     FileStat identity{};

@@ -179,7 +179,8 @@ std::uint32_t CubeLayer(SpirvEmitterState& state, std::uint32_t value) {
 std::uint32_t CoordF32(SpirvValueEmitContext& ctx, const ImageEmitAccess& access, std::uint32_t first, std::uint32_t components, std::uint32_t encoded, bool gradient = false) {
     const bool cube = access.image.cube;
     const auto present = std::min(encoded, components);
-    if (first == NoImageComponent || (encoded < components && (cube || encoded == 0u)) || access.mem.imageAddressComponents < first + present) {
+    const bool cubeFace = cube && access.mem.imageDimension == RdnaImageDimension::Dim2D;
+    if (first == NoImageComponent || (encoded < components && ((cube && !cubeFace) || encoded == 0u)) || access.mem.imageAddressComponents < first + present) {
         ctx.Fail(access.inst, "has an image address with too few coordinate components");
     }
     const auto component = [&](std::uint32_t index) { return index < present ? AddressF32(ctx, access, first + index) : ZeroF32(ctx.state); };
@@ -965,7 +966,7 @@ void EmitReadOp(SpirvValueEmitContext& ctx, const ImageEmitAccess& access) {
     const auto& dimensionInfo = RdnaImageDimensionInfoFor(access.image.dimension);
     const auto numericClass = access.image.numericClass;
     auto condition = ctx.Arg(access.inst, 2);
-    if (access.mem.imageDimension == RdnaImageDimension::Dim3D && access.image.dimension == RdnaImageDimension::Dim2D) {
+    if (access.mem.imageDimension == RdnaImageDimension::Dim3D && (access.image.dimension == RdnaImageDimension::Dim2D || access.image.dimension == RdnaImageDimension::Dim1D)) {
         condition = Binary(state, spv::OpLogicalAnd, TypeBool(state), condition, Binary(state, spv::OpIEqual, TypeBool(state), AddressU32(ctx, access, 2u), ConstantU32(state, 0u)));
     }
     if (VolumeSliceAddress(access)) {

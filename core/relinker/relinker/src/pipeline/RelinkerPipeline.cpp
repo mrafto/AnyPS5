@@ -525,6 +525,7 @@ RelinkResult RelinkerPipeline::Relink() {
         entry.TargetSection = ".got";
         entry.TargetOffset = ref.RelocationAddress;
         entry.CallSitesResolved = false;
+        entry.Weak = ref.Weak;
         entries.push_back(std::move(entry));
     }
 

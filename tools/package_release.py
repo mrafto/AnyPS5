@@ -1,6 +1,8 @@
 import argparse
+import os
 import re
 import shutil
+import stat
 import tarfile
 import tempfile
 import zipfile
@@ -18,6 +20,22 @@ def windows_runtime(build):
     raise RuntimeError(f"CMAKE_CXX_COMPILER is not configured in {build / 'CMakeCache.txt'}")
 
 
+def tracy_runtime(platform, build):
+    cache = build / "CMakeCache.txt"
+    if not cache.is_file():
+        return []
+    lines = cache.read_text(encoding="utf-8").splitlines()
+    enabled = next((line.partition("=")[2].upper() for line in lines if line.startswith("APS5_ENABLE_TRACY:")), "OFF")
+    if enabled in ("", "0", "OFF", "NO", "FALSE", "N", "IGNORE", "NOTFOUND") or enabled.endswith("-NOTFOUND"):
+        return []
+    pattern = "libTracyClient.dll" if platform == "windows" else "libTracyClient.so.*"
+    directory = build / "core/libs/libs"
+    clients = sorted(directory.glob(pattern))
+    if len(clients) != 1:
+        raise RuntimeError(f"Missing or ambiguous Tracy runtime for APS5_ENABLE_TRACY: {directory / pattern}")
+    return clients
+
+
 def package(platform, build, output, version):
     if not re.fullmatch(r"v[0-9A-Za-z][0-9A-Za-z._-]*", version) or version.endswith("."):
         raise ValueError(f"Invalid release tag for asset filenames: {version}")
@@ -31,6 +49,7 @@ def package(platform, build, output, version):
     if platform == "windows":
         runtime = windows_runtime(build)
         files.extend(runtime / name for name in ("libgcc_s_seh-1.dll", "libstdc++-6.dll", "libwinpthread-1.dll"))
+    files.extend(tracy_runtime(platform, build))
     binary = build / "core/relinker" / executable
     for file in [*files, binary]:
         if not file.is_file() or file.stat().st_size == 0:
@@ -41,6 +60,8 @@ def package(platform, build, output, version):
         destination = output / name
         if destination.exists() and not destination.is_file():
             raise RuntimeError(f"Release destination is not a file: {destination}")
+        if os.name == "nt" and os.path.lexists(destination) and destination.lstat().st_file_attributes & stat.FILE_ATTRIBUTE_READONLY:
+            raise RuntimeError(f"Release destination is read-only: {destination}")
     output.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".release-", dir=output) as temporary:
         staging = Path(temporary)

@@ -23,6 +23,7 @@
 #include <string>
 #include <tuple>
 #include <utility>
+#include <vector>
 
 namespace {
 
@@ -115,6 +116,13 @@ alignas(256) constexpr std::array<std::uint32_t, 30> DomainCode{
     0xe0341020, 0x04030e01, 0xbf8c3f70, 0x08040af2, 0x08040d02, 0x10201505, 0x3e201906, 0x3e201d02,
     0x10221705, 0x3e221b06, 0x3e221f02, 0xd5510012, 0x040a0d05, 0x102424ff, 0x40400000, 0x7e260280,
     0x7e2802f2, 0xf80008cf, 0x14131110, 0xf800020f, 0x14131214, 0xbf810000,
+};
+
+alignas(256) constexpr std::array<std::uint32_t, 31> DomainLoweredInterior{
+    0xf8000941, 0x00000000, 0x34020e84, 0x16020283, 0xe0341000, 0x04030a01, 0xe0341010, 0x04030c01,
+    0xe0341020, 0x04030e01, 0xbf8c3f70, 0x08040af2, 0x08040d02, 0x10201505, 0x3e201906, 0x3e201d02,
+    0x10221705, 0x3e221b06, 0x3e221f02, 0xd5510012, 0x040a0d05, 0x102424ff, 0x40400000, 0x08222511,
+    0x7e260280, 0x7e2802f2, 0xf80008cf, 0x14131110, 0xf800020f, 0x14131214, 0xbf810000,
 };
 
 alignas(256) constexpr std::array<std::uint32_t, 34> DomainRelativeData{
@@ -359,6 +367,8 @@ struct PatchDraw {
     std::span<const std::uint16_t> indices;
     float minLevel = 1.0f;
     float maxLevel = 64.0f;
+    std::uint32_t instances = 1;
+    std::uint32_t firstInstance = 0;
 };
 
 alignas(256) constexpr std::array<std::uint16_t, 12> NextInputIndices{
@@ -394,7 +404,7 @@ ShaderRecompiler::RecompileResult Compile(const ShaderRecompiler::SpirvTarget& t
         pixel = info;
     } else {
         vertex = ShaderRecompiler::ShaderVertexStageInfo{};
-        graphics = ShaderRecompiler::GraphicsCompileContext{hull ? 0u : 8u, {}, std::nullopt, patches.configuration, {reinterpret_cast<std::uintptr_t>(patches.indices.data()), static_cast<std::uint32_t>(patches.indices.size()), 2, 1}};
+        graphics = ShaderRecompiler::GraphicsCompileContext{hull ? 0u : 8u, {}, std::nullopt, patches.configuration, {reinterpret_cast<std::uintptr_t>(patches.indices.data()), static_cast<std::uint32_t>(patches.indices.size()), 2, patches.instances}};
     }
     auto layout = stage == ShaderStage::Fragment ? PixelPushLayout(pushCursor, target) : ShaderRecompiler::BindingLayout{0, 0, pushCursor, AgcDriver::Graphics::PipelinePushSlotBytes - pushCursor};
     if (layout.pushConstantOffsetBytes < AgcDriver::Graphics::PipelinePushSlotBytes) layout.pushConstantSizeBytes = ShaderRecompiler::TessellationLevelPushOffsetBytes - layout.pushConstantOffsetBytes;
@@ -477,7 +487,7 @@ void Draw(AgcDriver::VulkanDevice& device, const Stages& stages, VkCullModeFlags
     state.blend.colorWriteMask = 15;
     state.blends = {state.blend};
     state.blendConstants = {};
-    device.Draw(state, {reinterpret_cast<std::uintptr_t>(patches.indices.data()), static_cast<std::uint32_t>(patches.indices.size()), 2, 1, 0, true}, shaders);
+    device.Draw(state, {reinterpret_cast<std::uintptr_t>(patches.indices.data()), static_cast<std::uint32_t>(patches.indices.size()), 2, patches.instances, 0, true, 0, patches.firstInstance}, shaders);
     device.WaitIdle();
 }
 
@@ -621,6 +631,33 @@ void RequireRelativePatches(AgcDriver::VulkanDevice& device, const ShaderRecompi
     }
 }
 
+void RequireInstancedRelativePatches(AgcDriver::VulkanDevice& device, const ShaderRecompiler::SpirvTarget& target) {
+    const auto center = Row(-0.5f + 1.0f / 3.0f);
+    TessellationConfiguration restarting{3u, 3u, 1u, 2u, 2u, 4u, 8u};
+    restarting.breakAtInstance = true;
+    for (const auto& [patches, first, last] : {std::tuple{PatchDraw{{3u, 3u, 1u, 2u, 2u, 4u, 8u}, Indices, 1.0f, 64.0f, 2u, 1u}, 128, 64}, std::tuple{PatchDraw{{3u, 3u, 1u, 2u, 2u, 3u, 3u}, Indices, 1.0f, 64.0f, 2u, 1u}, 32, 96}, std::tuple{PatchDraw{restarting, Indices, 1.0f, 64.0f, 2u, 1u}, 32, 96}}) {
+        std::uint32_t cursor = 0;
+        const Stages stages{
+            Compile(target, ShaderStage::Local, LocalCode, cursor, patches),
+            Compile(target, ShaderStage::TessellationControl, HullRelativeData, cursor, patches),
+            Compile(target, ShaderStage::TessellationEvaluation, DomainPatchRead, cursor, patches),
+            Compile(target, ShaderStage::Fragment, PixelCode, cursor, patches),
+        };
+        Draw(device, stages, VK_CULL_MODE_NONE, VK_FRONT_FACE_COUNTER_CLOCKWISE, patches);
+        for (const auto& [patch, expected] : {std::pair{0u, first}, std::pair{2u, last}}) {
+            const auto pixel = PixelAt(Column(patch, 0.25f), center);
+            Require(pixel[0] == 255 && std::abs(pixel[2] - expected) <= 1, "the patch in column " + std::to_string(patch) + " of an instanced draw with " + std::to_string(patches.configuration.patchesPerGroup) + " patches per group and " + std::to_string(patches.configuration.primitiveGroupSize) + " primitives per group" + (patches.configuration.breakAtInstance ? " and BREAK_WAVE_AT_EOI" : "") + " did not take its blue channel from the hull's relative patch index across instances, " + PixelText(pixel));
+        }
+    }
+    const PatchDraw shared{{3u, 3u, 1u, 2u, 2u, 4u, 8u}, Indices, 1.0f, 64.0f, 2u, 1u};
+    ExpectRefusal(target, ShaderStage::TessellationEvaluation, DomainRelativeData, "domain program uses its relative patch index as data in an instanced draw", shared);
+    std::vector<std::uint32_t> capabilities(target.supportedCapabilities.begin(), target.supportedCapabilities.end());
+    std::erase(capabilities, static_cast<std::uint32_t>(spv::CapabilityDrawParameters));
+    auto withoutDrawParameters = target;
+    withoutDrawParameters.supportedCapabilities = capabilities;
+    ExpectRefusal(withoutDrawParameters, ShaderStage::TessellationControl, HullRelativeData, "shaderDrawParameters", shared);
+}
+
 class GuestBlock {
 public:
     GuestBlock() {
@@ -687,6 +724,32 @@ void RequireHullBdaReads(AgcDriver::VulkanDevice& device, const ShaderRecompiler
         Require(failure.find("BDA access failed") != std::string::npos && failure.find("stage=7 reason=1") != std::string::npos, program + ": the unmapped read was reported as \"" + failure + "\", not as a tessellation-control BDA fault");
     }
     address(0u);
+}
+
+Stages CompileLoweredInterior(const ShaderRecompiler::SpirvTarget& target, const PatchDraw& patches) {
+    std::uint32_t cursor = 0;
+    return {
+        Compile(target, ShaderStage::Local, LocalCode, cursor, patches),
+        Compile(target, ShaderStage::TessellationControl, HullCode, cursor, patches),
+        Compile(target, ShaderStage::TessellationEvaluation, DomainLoweredInterior, cursor, patches),
+        Compile(target, ShaderStage::Fragment, PixelCode, cursor, patches),
+    };
+}
+
+void RequireFractionalEvenPartitioning(AgcDriver::VulkanDevice& device, const ShaderRecompiler::SpirvTarget& target) {
+    const auto below = Row(-0.75f);
+    const PatchDraw integer{{3u, 3u, 1u, 0u, 2u}, Indices};
+    Draw(device, CompileLoweredInterior(target, integer), VK_CULL_MODE_NONE, VK_FRONT_FACE_COUNTER_CLOCKWISE, integer);
+    Require(CoveredPixels(0, false) > 100 && PixelAt(Column(0, 0.25f), below) == Background, "integer partitioning: the level-1 patch has a domain point inside it, " + PixelText(PixelAt(Column(0, 0.25f), below)));
+    Require(PixelAt(Column(2, 0.25f), below) != Background, "integer partitioning: the level-5 patch has no domain point inside it");
+    const PatchDraw patches{{3u, 3u, 1u, 3u, 2u}, Indices};
+    const auto stages = CompileLoweredInterior(target, patches);
+    Require(HasSpacing(stages.domain, spv::ExecutionModeSpacingFractionalEven) && !HasSpacing(stages.domain, spv::ExecutionModeSpacingFractionalOdd) && !HasSpacing(stages.domain, spv::ExecutionModeSpacingEqual), "fractional-even partitioning did not compile to fractional-even spacing");
+    Require(HasLevelBound(stages.hull, 64.0f) && !HasLevelBound(stages.hull, 63.0f), "fractional-even partitioning did not bound its tessellation factors at 64");
+    Draw(device, stages, VK_CULL_MODE_NONE, VK_FRONT_FACE_COUNTER_CLOCKWISE, patches);
+    Require(CoveredPixels(0, false) > 100 && PixelAt(Column(0, 0.25f), below) != Background, "fractional-even partitioning: the level-1 patch was not raised to level 2 with a domain point inside it");
+    Require(CoveredPixels(1, false) == 0 && PixelAt(Column(1, 0.25f), below) == Background, "fractional-even partitioning: the patch with level 0 was not culled");
+    Require(CoveredPixels(2, false) > 100 && PixelAt(Column(2, 0.25f), below) != Background, "fractional-even partitioning: the level-5 patch has no domain point inside it");
 }
 
 void RequireQuads(AgcDriver::VulkanDevice& device, const ShaderRecompiler::SpirvTarget& target) {
@@ -802,8 +865,6 @@ int main() {
         ExpectRefusal(target, ShaderStage::Local, LocalIndexAsData, "outside a tessellation ring or LDS address");
         ExpectRefusal(target, ShaderStage::TessellationControl, HullRelativeData, "GE_CNTL.PRIM_GRP_SIZE is 0", RecordPatches);
         ExpectRefusal(target, ShaderStage::TessellationEvaluation, DomainRelativeData, "GE_CNTL.PRIM_GRP_SIZE is 0", RecordPatches);
-        ExpectRefusal(target, ShaderStage::TessellationControl, HullRelativeData, "GE_CNTL.BREAK_WAVE_AT_EOI is clear", {{3u, 3u, 1u, 2u, 2u, 3u, 3u}, Indices});
-        ExpectRefusal(target, ShaderStage::TessellationEvaluation, DomainRelativeData, "GE_CNTL.BREAK_WAVE_AT_EOI is clear", {{3u, 3u, 1u, 2u, 2u, 3u, 3u}, Indices});
         ExpectRefusal(target, ShaderStage::TessellationControl, HullCode, "outside its patch's quad factors", {{3u, 3u, 2u, 2u, 2u}, Indices});
         ExpectRefusal(target, ShaderStage::TessellationControl, HullDescendingRecords, "not affine");
         ExpectRefusal(target, ShaderStage::TessellationControl, HullDescendingRecords, "not affine", {{3u, 3u, 1u, 2u, 2u, 158u}, Indices});
@@ -819,9 +880,11 @@ int main() {
         RequireCounterClockwise(*device, target);
         RequireLevelClamps(*device, target);
         RequireIntegerPartitioning(*device, target);
+        RequireFractionalEvenPartitioning(*device, target);
         RequireQuads(*device, target);
         RequirePatchConstants(*device, target);
         RequireRelativePatches(*device, target);
+        RequireInstancedRelativePatches(*device, target);
         RequireHullBdaReads(*device, target);
         RequireCompareBranches(target);
         device.reset();

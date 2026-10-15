@@ -39,9 +39,14 @@ struct TableColumn {
     bool address = false;
     std::vector<KeyDomain> keyDomains;
     bool unkeyed = false;
+    bool indirect = false;
+    std::uint32_t indirectOffset = 0;
+    std::uint32_t indirectImmediate = 0;
+    std::uint32_t foldedAddend = 0;
+    std::uint32_t foldedCarry = 0;
 
     bool operator==(const TableColumn& other) const {
-        return heapSource == other.heapSource && stride == other.stride && addend == other.addend && offset == other.offset && dwordCount == other.dwordCount && sampler == other.sampler && address == other.address;
+        return heapSource == other.heapSource && stride == other.stride && addend == other.addend && offset == other.offset && dwordCount == other.dwordCount && sampler == other.sampler && address == other.address && indirect == other.indirect && indirectOffset == other.indirectOffset && indirectImmediate == other.indirectImmediate && foldedAddend == other.foldedAddend && foldedCarry == other.foldedCarry;
     }
 };
 

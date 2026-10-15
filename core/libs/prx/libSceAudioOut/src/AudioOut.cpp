@@ -15,8 +15,10 @@
 #include "SDL.h"
 #include "SceTypes.hpp"
 #include "prx/libc/include/PreciseWait.hpp"
+#include "prx/libc/include/Shutdown.hpp"
 #include "prx/libkernel/Time/include/Time.hpp"
 #include "prx/libSceAudioOut/include/AudioOutSdl.hpp"
+#include "AudioOutShutdown.hpp"
 
 static constexpr int PORT_TYPE_MAIN = 0;
 static constexpr int PORT_TYPE_BGM = 1;
@@ -134,7 +136,7 @@ static bool openDevice(Port& port) {
     desired.samples = static_cast<Uint16>(port.samplesNum);
     desired.callback = nullptr;
     SDL_AudioSpec obtained{};
-    port.device = SDL_OpenAudioDevice(nullptr, 0, &desired, &obtained, SDL_AUDIO_ALLOW_ANY_CHANGE);
+    port.device = SDL_OpenAudioDevice(nullptr, 0, &desired, &obtained, 0);
     if (port.device == 0) {
         return false;
     }
@@ -228,31 +230,8 @@ static void queueAudio(Port& port, const void* data, std::unique_lock<std::mutex
     const std::uint32_t preparedSize = port.samplesNum *
         static_cast<std::uint32_t>(port.channels) * bytesPerSample(port.format);
 
-    SDL_AudioCVT cvt{};
-    const int cvtResult = SDL_BuildAudioCVT(
-        &cvt,
-        sdlFormat(port.format), static_cast<Uint8>(port.channels), static_cast<int>(port.freq),
-        port.spec.format, port.spec.channels, port.spec.freq);
-
-    if (cvtResult < 0) {
-        throw std::runtime_error(std::string("SDL_BuildAudioCVT: ") + SDL_GetError());
-    }
-
     const void* queueData = prepared;
-    std::uint32_t queueSize = preparedSize;
-    std::vector<std::uint8_t> convertBuf;
-
-    if (cvtResult > 0) {
-        convertBuf.resize(static_cast<std::size_t>(preparedSize) * cvt.len_mult);
-        std::memcpy(convertBuf.data(), prepared, preparedSize);
-        cvt.buf = convertBuf.data();
-        cvt.len = static_cast<int>(preparedSize);
-        if (SDL_ConvertAudio(&cvt) < 0) {
-            throw std::runtime_error(std::string("SDL_ConvertAudio: ") + SDL_GetError());
-        }
-        queueData = cvt.buf;
-        queueSize = static_cast<std::uint32_t>(cvt.len_cvt);
-    }
+    const std::uint32_t queueSize = preparedSize;
 
     const std::uint64_t bufferUs = port.freq != 0
         ? (1000000ULL * port.samplesNum) / port.freq
@@ -383,7 +362,8 @@ int APS5_VABI sceAudioOutClose(int handle) {
     return 0;
 }
 
-int APS5_VABI sceAudioOutOutput(int handle, const void* ptr) {
+int APS5_VABI sceAudioOutOutput(int handle, const void* ptr) try {
+    const AudioOutCall call;
     std::lock_guard<std::mutex> outputLock(g_outputMutex);
     std::unique_lock<std::mutex> lock(g_mutex);
     Port* port = getPort(handle);
@@ -398,13 +378,16 @@ int APS5_VABI sceAudioOutOutput(int handle, const void* ptr) {
     }
     if (ptr != nullptr) port->lastDataOutputTime = sceKernelGetProcessTime();
     return static_cast<int>(port->samplesNum);
+} catch (const ProcessShutdown&) {
+    LibcAwaitExit_nid_postfix();
 }
 
-int APS5_VABI sceAudioOutOutputs(AudioOutOutputParam* param, std::uint32_t num) {
+int APS5_VABI sceAudioOutOutputs(AudioOutOutputParam* param, std::uint32_t num) try {
     if (param == nullptr || num == 0) {
         return -2144993276;
     }
 
+    const AudioOutCall call;
     std::lock_guard<std::mutex> outputLock(g_outputMutex);
     std::unique_lock<std::mutex> lock(g_mutex);
 
@@ -430,6 +413,8 @@ int APS5_VABI sceAudioOutOutputs(AudioOutOutputParam* param, std::uint32_t num) 
     }
 
     return static_cast<int>(first.samplesNum);
+} catch (const ProcessShutdown&) {
+    LibcAwaitExit_nid_postfix();
 }
 
 int APS5_VABI sceAudioOutSetVolume(int handle, std::uint32_t flag, int* vol) {

@@ -121,6 +121,21 @@ enum class RasterPrimitive : std::uint8_t {
     Rectangle
 };
 
+namespace ReversedBlendCode {
+
+inline constexpr std::uint32_t Enable = 1u;
+inline constexpr std::uint32_t ColorShift = 8u;
+inline constexpr std::uint32_t SecondShift = 16u;
+inline constexpr std::uint32_t RouteBits = 2u;
+inline constexpr std::uint32_t RouteMask = 3u;
+inline constexpr std::uint32_t Routes = 0xffu;
+inline constexpr std::uint32_t Own = 0u;
+inline constexpr std::uint32_t Component0 = 1u;
+inline constexpr std::uint32_t Zero = 2u;
+inline constexpr std::uint32_t One = 3u;
+
+}
+
 struct ShaderPixelStageInfo {
     std::uint32_t interpolatorCount;
     std::array<std::uint32_t, 32> interpolatorSettings;
@@ -133,6 +148,7 @@ struct ShaderPixelStageInfo {
     bool posZ;
     bool posW;
     bool frontFace;
+    bool frontFaceAllBits;
     bool ancillary;
     bool sampleShading;
     bool noPerspective;
@@ -153,6 +169,9 @@ struct ShaderPixelStageInfo {
     RasterPrimitive rasterPrimitive = RasterPrimitive::Triangle;
     bool layerExported = false;
     bool ditheredAlphaToCoverage = false;
+    std::uint8_t quadPixelMask = 0xf;
+    std::array<std::uint16_t, 4> quadSampleMask{0xffffu, 0xffffu, 0xffffu, 0xffffu};
+    std::uint32_t reversedBlend = 0;
 };
 
 struct ShaderVertexBufferResource {
@@ -200,6 +219,7 @@ struct GuestContext {
     std::optional<ShaderVertexStageInfo> vertex;
     std::span<const MemoryRegion> memory;
     std::optional<ShaderFloatMode> floatMode;
+    std::span<const std::uint32_t> linkedCallFallbacks;
 };
 
 struct MeshTargetLimits {
@@ -293,6 +313,8 @@ struct TessellationConfiguration {
     std::uint32_t patchesPerGroup = 256;
     std::uint32_t primitiveGroupSize = 0;
     bool breakAtInstance = false;
+    std::uint32_t instancePatches = 0;
+    bool drawParameters = false;
 };
 
 inline constexpr std::uint32_t MeshDrawPushOffsetBytes = 104;
@@ -333,6 +355,11 @@ struct RecompileRequest {
     bool useCache = true;
 };
 
+inline std::uint32_t TessellationInstancePatches(const RecompileRequest& request) {
+    if (!request.graphics || !request.graphics->tessellation || request.graphics->draw.instanceCount <= 1u || request.graphics->tessellation->breakAtInstance) return 0u;
+    return request.graphics->draw.indexCount / request.graphics->tessellation->inputControlPoints;
+}
+
 enum class DescriptorKind {
     UniformBuffer,
     StorageBuffer,
@@ -349,7 +376,8 @@ enum class DescriptorImageShape {
     Image2DArray,
     ImageCube,
     Image3D,
-    Image1DArray
+    Image1DArray,
+    Image2DMultisample
 };
 
 enum class DescriptorRole {
@@ -422,6 +450,7 @@ struct FragmentParameter {
     bool perVertex;
     bool custom = false;
     bool flatP10 = false;
+    bool vertexOrder = false;
 };
 
 struct BarycentricEmulation {
@@ -527,6 +556,9 @@ struct CompiledShaderArtifact {
     std::vector<std::uint32_t> parameterExports;
     std::vector<FragmentParameter> fragmentParameters;
     BarycentricEmulation barycentricEmulation;
+    std::vector<std::uint32_t> stencilReferences;
+    bool stencilReplaySafe = false;
+    std::uint32_t stencilReferenceDword = 0xffffffffu;
     std::uint64_t variantId = 0;
 };
 

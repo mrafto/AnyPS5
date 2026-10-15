@@ -1,5 +1,7 @@
 import os
 import json
+import ctypes
+import stat
 import sys
 import tarfile
 import tempfile
@@ -74,6 +76,56 @@ class ReleasePackageTests(unittest.TestCase):
         self.assertEqual(list(self.output.iterdir()), [previous])
         self.assertEqual(previous.read_bytes(), b"existing output")
 
+    def test_tracy_packages_include_only_the_target_platform_client(self):
+        directory = self.build / "core/libs/libs"
+        for platform, name in (("linux", "libTracyClient.so.0.14.1"), ("windows", "libTracyClient.dll")):
+            with self.subTest(platform=platform):
+                client = directory / name
+                client.write_bytes(platform.encode() + b" Tracy client")
+                cache = "APS5_ENABLE_TRACY:BOOL=ON\n"
+                expected = {"libs/libc.prx", "libs/" + name}
+                if platform == "windows":
+                    runtime = self.root / "toolchain"
+                    runtime.mkdir()
+                    for runtime_name in ("libgcc_s_seh-1.dll", "libstdc++-6.dll", "libwinpthread-1.dll"):
+                        (runtime / runtime_name).write_bytes(runtime_name.encode())
+                        expected.add("libs/" + runtime_name)
+                    cache += "CMAKE_CXX_COMPILER:FILEPATH=" + (runtime / "g++.exe").as_posix() + "\n"
+                    (self.build / "core/relinker/relinker.exe").write_bytes(b"Windows executable")
+                (self.build / "CMakeCache.txt").write_text(cache, encoding="utf-8")
+                package_release.package(platform, self.build, self.output, "v1")
+                with zipfile.ZipFile(self.output / f"prx-{platform}-v1.zip") as archive:
+                    self.assertEqual(set(archive.namelist()), expected)
+                    self.assertEqual(archive.read("libs/" + name), client.read_bytes())
+                with tarfile.open(self.output / f"prx-{platform}-v1.tar.gz") as archive:
+                    self.assertEqual(set(archive.getnames()), expected)
+                    self.assertEqual(archive.extractfile("libs/" + name).read(), client.read_bytes())
+
+    def test_disabled_tracy_does_not_publish_stale_clients(self):
+        for name in ("libTracyClient.dll", "libTracyClient.so.0.14.1"):
+            (self.library.parent / name).write_bytes(b"old client")
+        for index, value in enumerate(("OFF", "0", "NO", "FALSE", "N", "IGNORE", "NOTFOUND", "TRACY-NOTFOUND", "")):
+            with self.subTest(value=value):
+                (self.build / "CMakeCache.txt").write_text(f"APS5_ENABLE_TRACY:BOOL={value}\n", encoding="utf-8")
+                output = self.output / str(index)
+                package_release.package("linux", self.build, output, "v1")
+                with zipfile.ZipFile(output / "prx-linux-v1.zip") as archive:
+                    self.assertEqual(archive.namelist(), ["libs/libc.prx"])
+
+    def test_missing_or_ambiguous_tracy_client_preserves_existing_assets(self):
+        (self.build / "CMakeCache.txt").write_text("APS5_ENABLE_TRACY:BOOL=ON\n", encoding="utf-8")
+        previous = {"prx-linux-v1.zip": b"old zip", "prx-linux-v1.tar.gz": b"old tar", "relinker-v1": b"old binary"}
+        self.output.mkdir()
+        for name, data in previous.items():
+            (self.output / name).write_bytes(data)
+        for clients in ((), ("libTracyClient.so.0.13.1", "libTracyClient.so.0.14.1")):
+            with self.subTest(clients=clients):
+                for name in clients:
+                    (self.library.parent / name).write_bytes(b"client bytes")
+                with self.assertRaisesRegex(RuntimeError, "Tracy"):
+                    package_release.package("linux", self.build, self.output, "v1")
+                self.assertEqual({file.name: file.read_bytes() for file in self.output.iterdir()}, previous)
+
     def test_source_discovery_does_not_depend_on_working_directory(self):
         with working_directory(self.root):
             package_release.package("linux", self.build, self.output, "v1.0")
@@ -144,6 +196,95 @@ class ReleasePackageTests(unittest.TestCase):
                     else:
                         self.assertEqual(destination.read_bytes(), b"old " + name.encode())
                 self.assertEqual((output / "unrelated.txt").read_bytes(), b"unrelated")
+
+    @unittest.skipUnless(os.name == "nt", "Windows read-only replacement semantics")
+    def test_readonly_destinations_preserve_all_existing_assets(self):
+        names = ["prx-linux-v1.zip", "prx-linux-v1.tar.gz", "relinker-v1"]
+        for index, blocked in enumerate(names):
+            with self.subTest(blocked=blocked):
+                output = self.output / str(index)
+                output.mkdir(parents=True)
+                previous = {name: b"old " + name.encode() for name in names}
+                previous["unrelated.txt"] = b"unrelated"
+                for name, content in previous.items():
+                    (output / name).write_bytes(content)
+                destination = output / blocked
+                destination.chmod(stat.S_IREAD)
+                try:
+                    with self.assertRaises((OSError, RuntimeError)) as error:
+                        package_release.package("linux", self.build, output, "v1")
+                    self.assertEqual({path.name: path.read_bytes() for path in output.iterdir()}, previous)
+                    self.assertIn("read-only", str(error.exception))
+                    self.assertFalse(destination.stat().st_mode & stat.S_IWRITE)
+                finally:
+                    destination.chmod(stat.S_IREAD | stat.S_IWRITE)
+
+    @unittest.skipIf(os.name == "nt", "POSIX allows replacement in a writable directory")
+    def test_posix_readonly_destination_can_be_replaced(self):
+        self.output.mkdir()
+        destination = self.output / "prx-linux-v1.zip"
+        destination.write_bytes(b"old archive")
+        destination.chmod(stat.S_IREAD)
+        try:
+            package_release.package("linux", self.build, self.output, "v1")
+            with zipfile.ZipFile(destination) as archive:
+                self.assertEqual(archive.read("libs/libc.prx"), b"library bytes")
+        finally:
+            destination.chmod(stat.S_IREAD | stat.S_IWRITE)
+
+    def file_link(self, link, target):
+        try:
+            link.symlink_to(target)
+        except OSError as error:
+            self.skipTest(f"File symlinks unavailable: {error}")
+
+    def link_attributes(self, link, attributes):
+        setter = ctypes.WinDLL("kernel32", use_last_error=True).SetFileAttributesW
+        setter.argtypes = [ctypes.c_wchar_p, ctypes.c_uint32]
+        setter.restype = ctypes.c_int
+        if not setter(str(link), attributes):
+            raise ctypes.WinError(ctypes.get_last_error())
+
+    @unittest.skipUnless(os.name == "nt", "Windows read-only symlink semantics")
+    def test_readonly_dangling_link_preserves_existing_assets(self):
+        self.output.mkdir()
+        tar = self.output / "prx-linux-v1.tar.gz"
+        binary = self.output / "relinker-v1"
+        tar.write_bytes(b"old tar")
+        binary.write_bytes(b"old executable")
+        link = self.output / "prx-linux-v1.zip"
+        self.file_link(link, "missing.zip")
+        self.link_attributes(link, stat.FILE_ATTRIBUTE_READONLY)
+        try:
+            self.assertFalse(link.exists())
+            with self.assertRaisesRegex(RuntimeError, "read-only"):
+                package_release.package("linux", self.build, self.output, "v1")
+            self.assertEqual(tar.read_bytes(), b"old tar")
+            self.assertEqual(binary.read_bytes(), b"old executable")
+            self.assertEqual(link.readlink(), Path("missing.zip"))
+            self.assertTrue(link.lstat().st_file_attributes & stat.FILE_ATTRIBUTE_READONLY)
+            self.assertEqual({path.name for path in self.output.iterdir()}, {tar.name, binary.name, link.name})
+        finally:
+            self.link_attributes(link, stat.FILE_ATTRIBUTE_NORMAL)
+
+    @unittest.skipUnless(os.name == "nt", "Windows link and target attributes are distinct")
+    def test_writable_link_to_readonly_target_can_be_replaced(self):
+        self.output.mkdir()
+        target = self.root / "original.zip"
+        target.write_bytes(b"original target")
+        link = self.output / "prx-linux-v1.zip"
+        self.file_link(link, target)
+        target.chmod(stat.S_IREAD)
+        try:
+            self.assertFalse(link.lstat().st_file_attributes & stat.FILE_ATTRIBUTE_READONLY)
+            package_release.package("linux", self.build, self.output, "v1")
+            self.assertFalse(link.is_symlink())
+            self.assertEqual(target.read_bytes(), b"original target")
+            self.assertFalse(target.stat().st_mode & stat.S_IWRITE)
+            with zipfile.ZipFile(link) as archive:
+                self.assertEqual(archive.read("libs/libc.prx"), b"library bytes")
+        finally:
+            target.chmod(stat.S_IREAD | stat.S_IWRITE)
 
     def test_invalid_tag_creates_no_assets(self):
         with self.assertRaises(ValueError):

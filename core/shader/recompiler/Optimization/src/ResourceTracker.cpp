@@ -539,6 +539,17 @@ private:
         return KeyDomain{sourceIndex, memory->offset, std::max(4u, 1u << zeros)};
     }
 
+    static IrValue* SplitImmediateAddend(IrValue* value, std::uint32_t& addend) {
+        value = value->Resolve();
+        addend = 0;
+        if (value->Opcode() == IrOpcode::IAdd32 && value->ArgumentCount() == 2u) {
+            if (immediateU32(value->Argument(0), addend)) return value->Argument(1)->Resolve();
+            if (immediateU32(value->Argument(1), addend)) return value->Argument(0)->Resolve();
+        }
+        addend = 0;
+        return value;
+    }
+
     bool TryMakeTableColumn(IrValue& handle, bool sampler, bool r128, TableColumnPlan& plan) {
         const auto expected = sampler ? IrOpcode::GetSamplerResource : IrOpcode::GetImageResource;
         const std::uint32_t width = sampler ? 4u : 8u;
@@ -558,6 +569,10 @@ private:
         }
         IrValue* heapHandle = nullptr;
         IrValue* offset = nullptr;
+        IrValue* base = nullptr;
+        std::uint32_t baseAddend = 0;
+        std::uint32_t carry = 0;
+        bool folded = false;
         std::uint32_t first = 0;
         bool address = false;
         for (std::uint32_t dword = 0; dword < words; dword++) {
@@ -568,20 +583,30 @@ private:
             if (memory == nullptr || !MemoryIndexBelongsTo(memoryIndex, *read)) {
                 return false;
             }
+            std::uint32_t readAddend = 0;
+            IrValue* readBase = SplitImmediateAddend(read->Argument(1), readAddend);
             if (dword == 0u) {
                 first = memory->offset;
                 address = addressRead;
-            } else if (addressRead != address || memory->offset != first + dword * static_cast<std::uint32_t>(sizeof(std::uint32_t))) {
+                base = readBase;
+                baseAddend = readAddend;
+            } else if (addressRead != address || memory->offset + readAddend != first + baseAddend + dword * static_cast<std::uint32_t>(sizeof(std::uint32_t))) {
                 return false;
+            } else if (readAddend != baseAddend) {
+                if (readAddend < baseAddend || static_cast<std::uint64_t>(memory->offset) + (readAddend - baseAddend) > 0x7fffffffu) {
+                    return false;
+                }
+                folded = true;
+                carry = std::max(carry, readAddend - baseAddend);
             }
             IrValue* currentHandle = read->Argument(0)->Resolve();
-            if (heapHandle != nullptr && currentHandle != heapHandle) {
+            if (heapHandle != nullptr && currentHandle != heapHandle && !EquivalentValue(m_program.Resources(), heapHandle, currentHandle)) {
                 return false;
             }
-            heapHandle = currentHandle;
+            if (heapHandle == nullptr) heapHandle = currentHandle;
             if (dword == 0u) {
                 offset = read->Argument(1)->Resolve();
-            } else if (!EquivalentValue(m_program.Resources(), offset, read->Argument(1))) {
+            } else if (!EquivalentValue(m_program.Resources(), base, readBase)) {
                 return false;
             }
             plan.memory.push_back(memoryIndex);
@@ -599,6 +624,10 @@ private:
         std::uint32_t stride = 0;
         std::uint32_t addend = 0;
         bool masked = false;
+        std::uint32_t descriptorOffset = 0;
+        if (address && immediateU32(offset, descriptorOffset)) {
+            return TryMakeIndirectColumn(handle, *heapHandle, sampler, words, descriptorOffset, first, plan);
+        }
         if (!MatchAffineOffset(offset, key, stride, addend)) {
             if (!MatchMaskedOffset(offset, key, stride)) {
                 return false;
@@ -619,7 +648,71 @@ private:
         column.maxKey = possibleU32Bits(key);
         column.sampler = sampler;
         column.address = address;
+        column.foldedAddend = folded ? baseAddend : 0u;
+        column.foldedCarry = folded ? carry : 0u;
         const auto domain = masked ? std::optional<KeyDomain>{} : MatchKeyDomain(key);
+        DescriptorSource columnSource = heapSource;
+        columnSource.tableColumn = column;
+        plan.handle = &handle;
+        plan.source = InternSource(columnSource);
+        plan.keyDomain = domain;
+        auto& shared = *m_sources[plan.source].tableColumn;
+        shared.maxKey = std::max(shared.maxKey, column.maxKey);
+        if (!domain.has_value()) {
+            shared.unkeyed = true;
+            shared.keyDomains.clear();
+        } else if (!shared.unkeyed && std::find(shared.keyDomains.begin(), shared.keyDomains.end(), *domain) == shared.keyDomains.end()) {
+            shared.keyDomains.push_back(*domain);
+        }
+        plan.offset = offset;
+        return true;
+    }
+
+    bool TryMakeIndirectColumn(IrValue& handle, IrValue& pointer, bool sampler, std::uint32_t words, std::uint32_t descriptorOffset, std::uint32_t descriptorImmediate, TableColumnPlan& plan) {
+        if (pointer.Opcode() != IrOpcode::GetAddressResource || pointer.ArgumentCount() != 2u) {
+            return false;
+        }
+        IrValue* bufferHandle = nullptr;
+        IrValue* offset = nullptr;
+        std::uint32_t first = 0;
+        for (std::uint32_t dword = 0; dword < 2u; dword++) {
+            IrValue* read = pointer.Argument(dword)->Resolve();
+            std::uint32_t memoryIndex = 0;
+            const MemoryInfo* memory = ScalarReadMemory(*read, memoryIndex);
+            if (memory == nullptr || !MemoryIndexBelongsTo(memoryIndex, *read)) {
+                return false;
+            }
+            if (dword == 0u) {
+                first = memory->offset;
+                bufferHandle = read->Argument(0)->Resolve();
+                offset = read->Argument(1)->Resolve();
+            } else if (memory->offset != first + static_cast<std::uint32_t>(sizeof(std::uint32_t)) || read->Argument(0)->Resolve() != bufferHandle || !EquivalentValue(m_program.Resources(), offset, read->Argument(1))) {
+                return false;
+            }
+        }
+        IrValue* key = nullptr;
+        std::uint32_t stride = 0;
+        std::uint32_t addend = 0;
+        if (!MatchAffineOffset(offset, key, stride, addend)) {
+            return false;
+        }
+        DescriptorSource heapSource;
+        std::uint32_t heapIndex = 0;
+        if (!MakeRuntimeSource(*bufferHandle, IrOpcode::GetBufferResource, 4u, heapIndex, heapSource)) {
+            return false;
+        }
+        TableColumn column;
+        column.heapSource = heapIndex;
+        column.stride = stride;
+        column.addend = addend;
+        column.offset = first;
+        column.dwordCount = words;
+        column.maxKey = possibleU32Bits(key);
+        column.sampler = sampler;
+        column.indirect = true;
+        column.indirectOffset = descriptorOffset;
+        column.indirectImmediate = descriptorImmediate;
+        const auto domain = MatchKeyDomain(key);
         DescriptorSource columnSource = heapSource;
         columnSource.tableColumn = column;
         plan.handle = &handle;
@@ -1376,6 +1469,7 @@ private:
             return std::numeric_limits<std::uint32_t>::max();
         }
         ImageResource image;
+        image.singleMipPlaneBiasCompatible = m_program.Resources().stage == IrShaderStage::Pixel;
         image.source = source;
         image.firstUsePc = pc;
         image.resourceClass = resourceClass;
@@ -1406,15 +1500,22 @@ private:
         image.atomic = image.atomic || atomic;
         image.srgbDecodeCompatible = image.srgbDecodeCompatible && !ImageOpcodeInfoOf(op).needsSampler;
         image.fmaskCompatible = image.fmaskCompatible && op == IrOpcode::ImageRead && memory.dataBits == 32u;
+        image.singleMipPlaneBiasCompatible = image.singleMipPlaneBiasCompatible && op == IrOpcode::ImageSampleRaw && memory.imageSampleFlags == RdnaImageSampleFlagBias && memory.dataBits == 32u && !memory.imageR128 && !memory.imagePacked && memory.imageByElements == 0u;
         image.depthBitsCompatible = image.depthBitsCompatible && memory.dataBits == 32u;
         image.constantSwizzleCompatible = image.constantSwizzleCompatible && (op == IrOpcode::ImageSampleRaw || op == IrOpcode::ImageGatherRaw);
+        const bool cubeFaceLoad = op == IrOpcode::ImageRead && !memory.imageHasMip && memory.imageSampleFlags == 0u;
+        const bool cubeFaceSample = op == IrOpcode::ImageSampleRaw && (memory.imageSampleFlags == 0u || memory.imageSampleFlags == RdnaImageSampleFlagLevelZero || memory.imageSampleFlags == RdnaImageSampleFlagLod);
+        image.cubeFaceCompatible = image.cubeFaceCompatible && (cubeFaceLoad || cubeFaceSample) && !memory.imagePacked && memory.imageByElements == 0u;
         const bool flatVolumeLoad = op == IrOpcode::ImageRead && memory.imageSampleFlags == 0u;
         const bool flatVolumeSample = op == IrOpcode::ImageSampleRaw && memory.imageSampleFlags == RdnaImageSampleFlagLevelZero;
         const bool flatVolumeQuery = op == IrOpcode::ImageQueryDimensions;
         image.flatVolumeCompatible = image.flatVolumeCompatible && (flatVolumeLoad || flatVolumeSample || flatVolumeQuery) && !memory.imagePacked && memory.imageByElements == 0u;
         const bool flatLineLoad = op == IrOpcode::ImageRead && !memory.imageHasMip && memory.imageSampleFlags == 0u;
-        const bool flatLineSample = op == IrOpcode::ImageSampleRaw && (memory.imageSampleFlags == RdnaImageSampleFlagLevelZero || memory.imageSampleFlags == 0u);
-        image.flatLineCompatible = image.flatLineCompatible && (flatLineLoad || flatLineSample) && !memory.imagePacked && memory.imageByElements == 0u;
+        const auto lineSampleFlags = memory.imageSampleFlags & ~RdnaImageSampleFlagCompare;
+        const bool flatLineSample = op == IrOpcode::ImageSampleRaw && (lineSampleFlags == RdnaImageSampleFlagLevelZero || lineSampleFlags == 0u);
+        const bool flatLineExplicitLod = op == IrOpcode::ImageSampleRaw && memory.imageSampleFlags == RdnaImageSampleFlagLod;
+        image.flatLineCompatible = image.flatLineCompatible && (flatLineLoad || flatLineSample || flatLineExplicitLod) && !memory.imagePacked && memory.imageByElements == 0u;
+        image.flatVolumeLineCompatible = image.flatVolumeLineCompatible && (flatLineLoad || flatLineSample) && !memory.imagePacked && memory.imageByElements == 0u;
         if ((memory.imageSampleFlags & RdnaImageSampleFlagCompare) != 0u) {
             constexpr auto unsupported = RdnaImageSampleFlagLod | RdnaImageSampleFlagDerivative;
             if (op == IrOpcode::ImageGatherRaw || (memory.imageSampleFlags & unsupported) != 0u) image.emulatedCompare |= EmulatedCompare::Unsupported;
