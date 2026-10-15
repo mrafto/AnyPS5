@@ -2185,19 +2185,6 @@ bool StorageTexture::compareUntracked(std::uint64_t address, std::size_t bytes, 
         return true;
     }
     untrackedCompares.fetch_add(1, std::memory_order_relaxed);
-    {
-        // [dbg] why the untracked compare memo missed (temporary)
-        static std::atomic<std::uint64_t> why[9];
-        static std::atomic<std::int64_t> whyLast{0};
-        if (!memoize) ++why[0];
-        else if (!whole) ++why[1];
-        else if (epoch == 0) ++why[2];
-        else if ((stamp[3] & 1u) != 0) ++why[3];
-        else for (int k = 0; k < 5; ++k) if (stamp[k] != comparedGuestBytes[k]) { ++why[4 + k]; break; }
-        const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-        auto last = whyLast.load();
-        if (nowMs - last > 10000 && whyLast.compare_exchange_strong(last, nowMs)) std::fprintf(stderr, "[dbg] untracked stamp refreshes %llu quiet write-backs %llu misses: nomemo %llu partial %llu epoch0 %llu forget %llu | kind %llu hint/epoch %llu stamp %llu forget %llu note %llu\n", (unsigned long long)untrackedStampRefreshes.load(), (unsigned long long)untrackedQuietWriteBacks.load(), (unsigned long long)why[0].load(), (unsigned long long)why[1].load(), (unsigned long long)why[2].load(), (unsigned long long)why[3].load(), (unsigned long long)why[4].load(), (unsigned long long)why[5].load(), (unsigned long long)why[6].load(), (unsigned long long)why[7].load(), (unsigned long long)why[8].load());
-    }
     const auto saved = std::span(original).subspan(static_cast<std::size_t>(address - descriptor.baseAddress), bytes);
     if (GuestMemory::EqualsCommittedUnsynced(address, saved)) {
         std::fill(changed.begin(), changed.end(), GuestMemory::BlockUnchanged);

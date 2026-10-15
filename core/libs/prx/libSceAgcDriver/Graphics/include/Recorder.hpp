@@ -113,6 +113,12 @@ public:
     void OnComplete(std::function<void()> action);
     void NotePendingWrite(std::uint64_t address, std::size_t bytes);
     void NotePendingFill(std::uint64_t address, std::size_t bytes, std::uint8_t value);
+    // A pending fill of a range with one repeated 32-bit word (a title's HTILE clear, for instance).
+    void NotePendingWordFill(std::uint64_t address, std::size_t bytes, std::uint32_t word);
+    // The word every byte of [address, address + bytes) holds once the recorded work lands, when the
+    // newest pending write over the range is a word fill (or a byte fill) covering all of it: nothing
+    // recorded after it writes the range, so its value is what a CPU read would see after a wait.
+    std::optional<std::uint32_t> KnownWordFill(std::uint64_t address, std::size_t bytes) const;
     // Notes several [begin, end) ranges and publishes the snapshot once (a dispatch writes many buffers).
     void NotePendingWrites(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
     bool PendingWriteOverlaps(std::uint64_t address, std::size_t bytes) const;
@@ -536,6 +542,8 @@ private:
         std::vector<std::pair<std::uint64_t, std::uint64_t>> writes;
         std::vector<std::uint64_t> writeNotes;
         std::vector<std::int16_t> writeValues;
+        // The 32-bit word a write fills its whole range with, or -1 (see NotePendingWordFill).
+        std::vector<std::int64_t> writeWords;
         // In-place reads (see NotePendingRead), dying with the batch: a finished batch's reads are done.
         struct Read {
             std::uint64_t begin;

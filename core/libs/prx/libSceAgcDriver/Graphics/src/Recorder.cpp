@@ -1000,6 +1000,7 @@ private:
 // GuestMemory flush hook: a CPU access to memory that recorded GPU work will write waits for that
 // work first; then storage image results pending for the range are stored. The recorder is only
 // dereferenced under the GpuMutex (it is destroyed with its device under that lock).
+
 void FlushForAccess(std::uint64_t address, std::size_t bytes) {
     hookCalls.fetch_add(1, std::memory_order_relaxed);
     // A label this worker queued but has not recorded writes the range: in queue order the label
@@ -2700,6 +2701,7 @@ bool Recorder::noteWrite(std::uint64_t address, std::size_t bytes, bool ownLabel
     open->writes.emplace_back(address, end);
     open->writeNotes.push_back(++writeNoteCount);
     open->writeValues.push_back(static_cast<std::int16_t>(value));
+    open->writeWords.push_back(value >= 0 ? static_cast<std::int64_t>(static_cast<std::uint32_t>(value & 0xff) * 0x01010101u) : -1);
     if (!ownLabel) markOverwritten(address, end);
     // A poller waiting on this range learns that the open batch may now hold its producer.
     if (activeRecorder == this) writeGeneration.fetch_add(1, std::memory_order_release);
@@ -2727,6 +2729,7 @@ void Recorder::noteWriteOn(Batch& batch, std::uint64_t address, std::size_t byte
     batch.writes.emplace_back(address, address + bytes);
     batch.writeNotes.push_back(++writeNoteCount);
     batch.writeValues.push_back(-1);
+    batch.writeWords.push_back(-1);
     if (!ownLabel) markOverwritten(address, address + bytes);
     if (activeRecorder == this) writeGeneration.fetch_add(1, std::memory_order_release);
     if (!SnapshotCovers(address, address + bytes)) {
@@ -2757,6 +2760,37 @@ void Recorder::NotePendingFill(std::uint64_t address, std::size_t bytes, std::ui
     const std::array ranges{std::pair{address, address + bytes}};
     publishPendingWrites(ranges);
     std::atomic_thread_fence(std::memory_order_seq_cst);
+}
+
+void Recorder::NotePendingWordFill(std::uint64_t address, std::size_t bytes, std::uint32_t word) {
+    const bool publish = noteWrite(address, bytes);
+    if (bytes != 0 && open != nullptr && !open->writeWords.empty()) open->writeWords.back() = word;
+    if (!publish) return;
+    const std::array ranges{std::pair{address, address + bytes}};
+    publishPendingWrites(ranges);
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+}
+
+std::optional<std::uint32_t> Recorder::KnownWordFill(std::uint64_t address, std::size_t bytes) const {
+    if (bytes == 0) return std::nullopt;
+    const auto end = address + bytes;
+    std::uint64_t newest = 0;
+    std::int64_t word = -1;
+    bool covers = false;
+    const auto scan = [&](const Batch& batch) {
+        if (batch.writeWords.size() != batch.writes.size() || batch.writeNotes.size() != batch.writes.size()) return;
+        for (std::size_t i = 0; i < batch.writes.size(); ++i) {
+            const auto& [begin, stop] = batch.writes[i];
+            if (!(address < stop && begin < end) || batch.writeNotes[i] < newest) continue;
+            newest = batch.writeNotes[i];
+            word = batch.writeWords[i];
+            covers = begin <= address && end <= stop;
+        }
+    };
+    for (const auto& batch : inFlight) scan(*batch);
+    if (open != nullptr) scan(*open);
+    if (newest == 0 || !covers || word < 0) return std::nullopt;
+    return static_cast<std::uint32_t>(word);
 }
 
 void Recorder::NotePendingWrites(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {

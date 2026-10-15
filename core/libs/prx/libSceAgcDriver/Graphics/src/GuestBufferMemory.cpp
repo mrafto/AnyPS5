@@ -1078,10 +1078,6 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
         static auto lastReport = std::chrono::steady_clock::now() - std::chrono::seconds(60);
         ++refused;
         refusedBytes += bytes;
-        {
-            static int shown = 0;
-            if (shown++ < 12) std::fprintf(stderr, "[dbg] import refused 0x%llx+0x%llx joined=%d evict=%d live=%llu replaced=%llu evictable=%llu budget=%llu MiB\n", static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), joined, evict, static_cast<unsigned long long>(state.liveBytes >> 20u), static_cast<unsigned long long>(replaced >> 20u), static_cast<unsigned long long>(evictableBytes(state, base, base + bytes) >> 20u), static_cast<unsigned long long>(budget >> 20u));
-        }
         if (std::chrono::steady_clock::now() - lastReport > std::chrono::seconds(10)) {
             lastReport = std::chrono::steady_clock::now();
             std::fprintf(stderr, "[gpu] host import budget: %llu MiB live of %llu MiB (APS5_HOST_IMPORT_MIB); %llu imports (%llu MiB) refused so far, last 0x%llx+0x%llx\n", static_cast<unsigned long long>(state.liveBytes >> 20u), static_cast<unsigned long long>(budget >> 20u), static_cast<unsigned long long>(refused), static_cast<unsigned long long>(refusedBytes >> 20u), static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes));

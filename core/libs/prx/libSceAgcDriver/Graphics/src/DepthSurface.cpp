@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
@@ -13,6 +14,7 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <cstdlib>
 #include <limits>
 #include <shared_mutex>
 #include <cstdio>
@@ -954,6 +956,35 @@ VkImageAspectFlags storeBackClearedHtile(const Context& context, const DepthTarg
     if (!GuestMemory::Accessible(reinterpret_cast<const void*>(target.htileAddress), bytes, true)) return 0;
     const auto collected = GuestMemory::CollectWrites(target.htileAddress, bytes);
     auto* recorder = RecorderFor(context);
+    // The title clears depth by filling the HTILE with one word on the GPU (a 0xfffffff0 fill every
+    // frame): that fill, the newest pending write over the whole range, gives every word without
+    // waiting for the GPU to land it. The expansion is then a word fill recorded behind it on the
+    // import, never a CPU store that the pending fill would overwrite. APS5_NO_HTILE_FILL_KNOWN=1
+    // reads the words after a wait, as before.
+    static const bool fillUnknown = std::getenv("APS5_NO_HTILE_FILL_KNOWN") != nullptr;
+    if (!fillUnknown && recorder != nullptr && bytes % 4u == 0 && target.htileAddress % 4u == 0 && recorder->PendingWriteOverlaps(target.htileAddress, bytes)) {
+        if (const auto word = recorder->KnownWordFill(target.htileAddress, bytes)) {
+            const auto* import = HostImportFor(context, target.htileAddress, bytes);
+            if (import != nullptr) {
+                const VkImageAspectFlags cleared = (VK_IMAGE_ASPECT_DEPTH_BIT | (target.htileStencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0u)) & HtileFillClears(*word, target.htileStencil);
+                if (cleared != 0) {
+                    const auto expanded = expandedHtileWord(*word, target.htileStencil, cleared);
+                    if (expanded != *word) {
+                        const auto commands = recorder->Commands();
+                        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+                        context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(commands, import->buffer, target.htileAddress - import->base, bytes, expanded);
+                        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_HOST_READ_BIT);
+                        Recorder::CountBarriers(Recorder::CommandClass::Fill, 2);
+                        recorder->NotePendingWordFill(target.htileAddress, bytes, expanded);
+                        GuestMemory::MarkWritten(target.htileAddress, bytes);
+                    }
+                }
+                std::lock_guard lock(htileReadsMutex());
+                htileReads().erase(target.htileAddress);
+                return cleared;
+            }
+        }
+    }
     if (recorder == nullptr || !recorder->PendingWriteOverlaps(target.htileAddress, bytes)) {
         std::lock_guard lock(htileReadsMutex());
         const auto found = htileReads().find(target.htileAddress);

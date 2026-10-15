@@ -18,7 +18,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
-#include <map>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -2177,36 +2176,15 @@ void ReadCommittedUnsynced(std::uint64_t address, std::span<std::byte> destinati
     copyCommitted(address, destination);
 }
 
-thread_local const void* dbgOuterCaller = nullptr;
-
 bool EqualsCommitted(std::uint64_t address, std::span<const std::byte> bytes) {
     if (bytes.empty()) return true;
     FlushGpuWrites(address, bytes.size());
-    dbgOuterCaller = __builtin_return_address(0);
-    const bool equal = EqualsCommittedUnsynced(address, bytes);
-    dbgOuterCaller = nullptr;
-    return equal;
+    return EqualsCommittedUnsynced(address, bytes);
 }
 
 bool EqualsCommittedUnsynced(std::uint64_t address, std::span<const std::byte> bytes) {
     if (bytes.empty()) return true;
     const TimedAccess timed(CounterCompare, bytes.size());
-    if (MemoryProfiled()) {
-        // [dbg] compare attribution (temporary)
-        static std::mutex dbgMutex;
-        static std::map<std::array<unsigned long long, 3>, std::pair<std::uint64_t, std::uint64_t>> dbgCallers;
-        static auto dbgLast = std::chrono::steady_clock::now();
-        std::array<unsigned long long, 3> frames{ModuleOffset(__builtin_return_address(0)), ModuleOffset(dbgOuterCaller), 0};
-        std::lock_guard lock(dbgMutex);
-        auto& entry = dbgCallers[frames];
-        ++entry.first;
-        entry.second += bytes.size();
-        if (std::chrono::steady_clock::now() - dbgLast > std::chrono::seconds(10)) {
-            dbgLast = std::chrono::steady_clock::now();
-            for (const auto& [key, value] : dbgCallers) std::fprintf(stderr, "[dbg] compare +0x%llx<+0x%llx<+0x%llx calls %llu MiB %llu\n", key[0], key[1], key[2], static_cast<unsigned long long>(value.first), static_cast<unsigned long long>(value.second >> 20u));
-            dbgCallers.clear();
-        }
-    }
     if (Accessible(reinterpret_cast<const void*>(address), bytes.size())) return std::memcmp(reinterpret_cast<const void*>(address), bytes.data(), bytes.size()) == 0;
     for (const auto& [begin, end] : CommittedRanges(address, bytes.size())) {
         if (std::memcmp(reinterpret_cast<const void*>(begin), bytes.data() + (begin - address), static_cast<std::size_t>(end - begin)) != 0) return false;

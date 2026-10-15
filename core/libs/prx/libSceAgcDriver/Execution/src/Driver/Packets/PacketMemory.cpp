@@ -179,6 +179,39 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
                 }
             }
         }
+        // An immediate dword written into the GDS (the title resets its GDS counters this way on the
+        // graphics and compute queues, about 1k packets per 10 s at the title screen) is a small store
+        // to the guest memory that backs the GDS: recorded on the GPU in queue order like any packet
+        // store, instead of draining the device for a CPU write. APS5_GDS_STORE_DRAIN=1 drains as before.
+        static const bool gdsDrain = std::getenv("APS5_GDS_STORE_DRAIN") != nullptr;
+        if (drained && !gdsDrain && opcode == 0x50 && packet.size() >= 7 && Pm4::DmaSource(packet) == 2 && Pm4::DmaDestination(packet) == 1 && packet[5] == 0) {
+            const std::size_t bytes = packet[6] & 0x3ffffffu;
+            const std::uint64_t offset = packet[4];
+            if (bytes != 0 && bytes <= gpuStoreLimit && bytes % 4 == 0 && offset % 4 == 0 && offset <= Pm4::GdsBytes && bytes <= Pm4::GdsBytes - offset) {
+                const auto address = Pm4::GdsAddress() + offset;
+                std::vector<std::uint32_t> words(bytes / 4, packet[2]);
+                const auto data = std::as_bytes(std::span(words));
+                GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
+                std::lock_guard gpuLock(GuestMemory::GpuMutex());
+                const auto localDevice = device.Load();
+                Graphics::StorageTexture::FlushPending(address, bytes, nullptr, "packet store", Graphics::PublishScope::PartialUnits);
+                recordDeferredLabels(localDevice.get(), submission.queue);
+                const auto stamp = ++eventSerial;
+                const auto reason = localDevice != nullptr ? localDevice->WriteLabelOnGpu(address, data, stamp, submission.queue) : 4;
+                if (reason == 0 || reason == 1 || reason == 5) noteLabelStore(address, data, stamp, submission.queue);
+                if (reason == 0 || reason == 5) {
+                    ++(reason == 0 ? storesOnGpu : storesBehindCompletions);
+                    wroteOnGpu = true;
+                    drained = false;
+                } else if (reason == 1) {
+                    GuestMemory::Write(address, data, 1);
+                    ++storesOnCpu;
+                    wroteOnGpu = true;
+                    drained = false;
+                }
+                Graphics::Recorder::CloseLabelGroup(GuestMemory::TrackerGeneration());
+            }
+        }
         if (drained) ++storesDrained;
     }
 
