@@ -18,6 +18,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <map>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -1565,6 +1566,49 @@ std::uint64_t UntrackedHint(std::uint64_t address, std::size_t bytes) {
 #endif
 }
 
+bool UntrackedChangedBlocks(std::uint64_t address, std::size_t bytes, std::uint64_t since, std::span<std::uint8_t> changed, bool& cpu) {
+    cpu = false;
+#ifdef _WIN32
+    if (bytes == 0 || since == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return false;
+    const auto first = address & ~(std::uint64_t{WritePageBytes} - 1);
+    const auto stop = (address + bytes + WritePageBytes - 1) & ~(std::uint64_t{WritePageBytes} - 1);
+    const auto firstBlock = address / WriteBlockBytes;
+    if (changed.size() != (address + bytes - 1) / WriteBlockBytes - firstBlock + 1) return false;
+    const auto epoch = currentCollectEpoch();
+    auto& tracker = Tracker();
+    const auto lock = lockTracker(tracker);
+    tracker.initialize();
+    if (!tracker.watched || !tracker.hinted(first, stop)) return false;
+    // The CPU stores since the last walk become hint stamps first (memoized per epoch, as UntrackedHint).
+    const auto unwatched = unwatchSerial.load(std::memory_order_relaxed);
+    const bool memoized = collectMemoEnabled() && std::any_of(threadHintMemo.entries.begin(), threadHintMemo.entries.end(), [&](const WriteTracker::Memo& entry) {
+        return entry.epoch == epoch && entry.unwatched == unwatched && entry.begin <= first && stop <= entry.end;
+    });
+    if (memoized) {
+        collectMemoHits.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        const TimedAccess timed(CounterCollect, bytes);
+        if (!walkHints(tracker, first, stop)) return false;
+        if (collectMemoEnabled()) threadHintMemo.entries[threadHintMemo.next++ % threadHintMemo.entries.size()] = {first, stop, epoch, unwatched};
+    }
+    for (std::size_t k = 0; k < changed.size(); ++k) {
+        const auto blockAddress = (firstBlock + k) * WriteBlockBytes;
+        const auto begin = std::max<std::uint64_t>(blockAddress, first);
+        const bool cpuWrote = tracker.hintBlocks[tracker.blockOf(begin)] > since;
+        const bool driverWrote = !tracker.unstampedStores.empty() && tracker.unstampedStores[(firstBlock + k) % WriteTracker::UnstampedSlots] > since;
+        cpu = cpu || cpuWrote;
+        changed[k] = cpuWrote || driverWrote ? BlockWritten : BlockUnchanged;
+    }
+    return true;
+#else
+    static_cast<void>(address);
+    static_cast<void>(bytes);
+    static_cast<void>(since);
+    static_cast<void>(changed);
+    return false;
+#endif
+}
+
 bool UnchangedSinceCollected(std::uint64_t address, std::size_t bytes, std::uint64_t generation) {
     if (CollectWritesUncached(address, bytes) == 0) return false;
     auto& tracker = Tracker();
@@ -2046,15 +2090,36 @@ void ReadCommittedUnsynced(std::uint64_t address, std::span<std::byte> destinati
     copyCommitted(address, destination);
 }
 
+thread_local const void* dbgOuterCaller = nullptr;
+
 bool EqualsCommitted(std::uint64_t address, std::span<const std::byte> bytes) {
     if (bytes.empty()) return true;
     FlushGpuWrites(address, bytes.size());
-    return EqualsCommittedUnsynced(address, bytes);
+    dbgOuterCaller = __builtin_return_address(0);
+    const bool equal = EqualsCommittedUnsynced(address, bytes);
+    dbgOuterCaller = nullptr;
+    return equal;
 }
 
 bool EqualsCommittedUnsynced(std::uint64_t address, std::span<const std::byte> bytes) {
     if (bytes.empty()) return true;
     const TimedAccess timed(CounterCompare, bytes.size());
+    if (MemoryProfiled()) {
+        // [dbg] compare attribution (temporary)
+        static std::mutex dbgMutex;
+        static std::map<std::array<unsigned long long, 3>, std::pair<std::uint64_t, std::uint64_t>> dbgCallers;
+        static auto dbgLast = std::chrono::steady_clock::now();
+        std::array<unsigned long long, 3> frames{ModuleOffset(__builtin_return_address(0)), ModuleOffset(dbgOuterCaller), 0};
+        std::lock_guard lock(dbgMutex);
+        auto& entry = dbgCallers[frames];
+        ++entry.first;
+        entry.second += bytes.size();
+        if (std::chrono::steady_clock::now() - dbgLast > std::chrono::seconds(10)) {
+            dbgLast = std::chrono::steady_clock::now();
+            for (const auto& [key, value] : dbgCallers) std::fprintf(stderr, "[dbg] compare +0x%llx<+0x%llx<+0x%llx calls %llu MiB %llu\n", key[0], key[1], key[2], static_cast<unsigned long long>(value.first), static_cast<unsigned long long>(value.second >> 20u));
+            dbgCallers.clear();
+        }
+    }
     if (Accessible(reinterpret_cast<const void*>(address), bytes.size())) return std::memcmp(reinterpret_cast<const void*>(address), bytes.data(), bytes.size()) == 0;
     for (const auto& [begin, end] : CommittedRanges(address, bytes.size())) {
         if (std::memcmp(reinterpret_cast<const void*>(begin), bytes.data() + (begin - address), static_cast<std::size_t>(end - begin)) != 0) return false;

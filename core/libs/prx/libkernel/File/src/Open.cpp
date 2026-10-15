@@ -52,12 +52,17 @@ static std::int64_t NativeLseek(int fd, std::int64_t offset, int whence) {
     errno = ESPIPE;
     return -1;
 }
+extern "C" _invalid_parameter_handler _set_thread_local_invalid_parameter_handler(_invalid_parameter_handler);
+static void IgnoreInvalidParameter(const wchar_t*, const wchar_t*, const wchar_t*, unsigned int, std::uintptr_t) {}
 static int NativeRead(int fd, void* buf, std::size_t n) {
     if (n > static_cast<std::size_t>(std::numeric_limits<unsigned int>::max())) {
         throw std::runtime_error("sceKernelRead: nbytes exceeds platform limit");
     }
     const auto positioned = File::LockPositionedTransfer(fd);
+    // A descriptor that another thread closed meanwhile is a bad descriptor (EBADF), not a fatal error.
+    const auto previous = _set_thread_local_invalid_parameter_handler(IgnoreInvalidParameter);
     const int result = ::_read(fd, buf, static_cast<unsigned int>(n));
+    _set_thread_local_invalid_parameter_handler(previous);
     if (result < 0 && _doserrno == ERROR_NO_DATA) errno = EAGAIN;
     if (result == 0 && File::DirectoryDescriptorPath(fd)) {
         errno = EISDIR;
@@ -76,8 +81,6 @@ static int NativeWrite(int fd, const void* buf, std::size_t n) {
     if (result < 0 && errno == ENOSPC && _doserrno == 0 && ::GetFileType(reinterpret_cast<HANDLE>(::_get_osfhandle(fd))) == FILE_TYPE_PIPE) errno = EAGAIN;
     return result;
 }
-extern "C" _invalid_parameter_handler _set_thread_local_invalid_parameter_handler(_invalid_parameter_handler);
-static void IgnoreInvalidParameter(const wchar_t*, const wchar_t*, const wchar_t*, unsigned int, std::uintptr_t) {}
 static int NativeClose(int fd) {
     const auto previous = _set_thread_local_invalid_parameter_handler(IgnoreInvalidParameter);
     const int result = ::_close(fd);

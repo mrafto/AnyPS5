@@ -168,6 +168,9 @@ struct MirrorStats {
 };
 MirrorStats MirrorCounters();
 void ClearImageMirrors(VkDevice device);
+// A shader read `address` and no BDA table entry covers it. True when it lies in a registered range kept out of the table
+// until first used (APS5_LAZY_RANGE_MIB): the range is mapped from the next build, and the fault is not an error.
+bool NoteDeferredRangeAccess(std::uint64_t address);
 void ClearHostImports(VkDevice device);
 
 struct AddressCopy {

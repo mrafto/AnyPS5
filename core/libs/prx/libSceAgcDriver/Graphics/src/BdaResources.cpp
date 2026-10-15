@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
 #include "ImageTableAbi.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include <algorithm>
 #include <atomic>
 #include <bit>
@@ -273,6 +274,10 @@ void BdaResources::CheckFault() const {
             message << ": poison entry " << report.bytes;
         }
         throw std::runtime_error(message.str());
+    }
+    if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::Unmapped && NoteDeferredRangeAccess(report.address)) {
+        std::memset(fault->Bytes().data(), 0, fault->Bytes().size());
+        return;
     }
     std::ostringstream message;
     message << "BDA access failed: address=0x" << std::hex << report.address << " instruction=0x" << report.instruction << std::dec << " bytes=" << report.bytes << " stage=" << report.stage << " reason=" << static_cast<std::uint32_t>(report.reason);

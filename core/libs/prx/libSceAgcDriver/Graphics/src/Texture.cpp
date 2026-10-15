@@ -91,6 +91,8 @@ std::atomic<std::uint64_t> flushedAfterSkip{0}, flushedAfterSkipSameSite{0}, sta
 std::atomic<std::uint64_t> depthCopyTextures{0}, depthCopyRefreshes{0};
 std::atomic<std::uint64_t> refreshesProved{0};
 std::atomic<std::uint64_t> untrackedCompares{0};
+// Refreshes of memory outside the write watch that took their changed blocks from stamps (no compare).
+std::atomic<std::uint64_t> untrackedStampRefreshes{0};
 
 struct StorageTraffic {
     std::mutex mutex;
@@ -1771,6 +1773,7 @@ bool StorageTexture::Refresh() {
     bool stamped = true;
     bool tracked = true;
     bool compared = false;
+    bool stampProved = false;
     bool keysChanged = false;
     bool cpuWrote = false;
     bool direct = false;
@@ -1781,12 +1784,48 @@ bool StorageTexture::Refresh() {
             const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::TextureCompare);
             return GuestMemory::EqualsCommitted(descriptor.baseAddress, original);
         };
+        // Memory outside the write watch that keeps hints (a Windows host import): the blocks the CPU
+        // or the driver wrote since the last Refresh took the guest bytes in, from the hints and the
+        // driver's store stamps, plus the recorded work still writing the range. When only the
+        // driver wrote (an alias's GPU write-back over a reused render-target pool, mostly), those
+        // blocks are known changed without reading them: no wait for the GPU to land the stores and
+        // no byte compare, and the GPU-direct upload that follows is ordered behind them on the
+        // queue. A CPU store, a remap, or results of this image still pending keep the compare (its
+        // verdict on equal bytes decides what is dropped). A block stamped with unchanged bytes is
+        // uploaded again, never treated as current. APS5_NO_UNTRACKED_STAMPS=1 compares as before.
+        const auto untrackedBlocks = [&](std::uint64_t since, std::uint64_t forget) {
+            static const bool disabled = std::getenv("APS5_NO_UNTRACKED_STAMPS") != nullptr;
+            if (disabled || since == 0 || (forget & 1u) != 0 || forget != untrackedForget) return false;
+            if (std::any_of(layerPending.begin(), layerPending.end(), [](bool pending) { return pending; })) return false;
+            const auto bytes = static_cast<std::size_t>(guestBytes);
+            bool cpu = false;
+            if (!GuestMemory::UntrackedChangedBlocks(descriptor.baseAddress, bytes, since, stampedBlocks, cpu) || cpu) return false;
+            if (const auto* recorder = Recorder::Active()) {
+                const auto first = descriptor.baseAddress / 65536;
+                for (const auto& write : recorder->PendingWritesOver(descriptor.baseAddress, bytes)) {
+                    const auto from = std::max(write.begin, descriptor.baseAddress) / 65536 - first;
+                    const auto to = (std::min(write.end, descriptor.baseAddress + guestBytes) - 1) / 65536 - first;
+                    for (auto k = from; k <= to && k < stampedBlocks.size(); ++k) stampedBlocks[k] = GuestMemory::BlockWritten;
+                }
+            }
+            untrackedStampRefreshes.fetch_add(1, std::memory_order_relaxed);
+            return true;
+        };
         const auto scanBlocks = [&] {
             blockGenerations(generations);
             stampedBlocks.assign(generations.size(), 0);
             cpuBlocks.assign(generations.size(), 0);
             tracked = GuestMemory::ChangedBlocks(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), generations, stampedBlocks, cpuBlocks);
-            compared = !tracked && compareUntracked(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), stampedBlocks, true);
+            if (!tracked) {
+                // Read before the hint walk and the compare: any store after it is stamped newer.
+                const auto since = untrackedSince;
+                untrackedSince = GuestMemory::TrackerGeneration();
+                const auto forget = GuestMemory::ForgetSerial();
+                stampProved = untrackedBlocks(since, forget);
+                untrackedForget = forget;
+                if (!stampProved) stampedBlocks.assign(generations.size(), GuestMemory::BlockWritten);
+            }
+            compared = !tracked && (stampProved || compareUntracked(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), stampedBlocks, true));
             if (compared) {
                 for (const auto& [from, unitGeneration] : keptAtUnwatch) {
                     const auto unit = static_cast<std::uint32_t>((from - descriptor.baseAddress) / trackedLayerBytes);
@@ -1847,7 +1886,7 @@ bool StorageTexture::Refresh() {
         for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
             if (changed[layer] && layerPending[layer]) pendingChanged = true;
         }
-        if (!unchanged && !keysChanged && !pendingChanged && originalHolds(descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) && equalsOriginal()) {
+        if (!unchanged && !keysChanged && !pendingChanged && !stampProved && originalHolds(descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) && equalsOriginal()) {
             unchanged = true;
             stamped = false;
         }
@@ -2125,6 +2164,19 @@ bool StorageTexture::compareUntracked(std::uint64_t address, std::size_t bytes, 
         return true;
     }
     untrackedCompares.fetch_add(1, std::memory_order_relaxed);
+    {
+        // [dbg] why the untracked compare memo missed (temporary)
+        static std::atomic<std::uint64_t> why[9];
+        static std::atomic<std::int64_t> whyLast{0};
+        if (!memoize) ++why[0];
+        else if (!whole) ++why[1];
+        else if (epoch == 0) ++why[2];
+        else if ((stamp[3] & 1u) != 0) ++why[3];
+        else for (int k = 0; k < 5; ++k) if (stamp[k] != comparedGuestBytes[k]) { ++why[4 + k]; break; }
+        const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        auto last = whyLast.load();
+        if (nowMs - last > 10000 && whyLast.compare_exchange_strong(last, nowMs)) std::fprintf(stderr, "[dbg] untracked stamp refreshes %llu misses: nomemo %llu partial %llu epoch0 %llu forget %llu | kind %llu hint/epoch %llu stamp %llu forget %llu note %llu\n", (unsigned long long)why[0].load(), (unsigned long long)why[1].load(), (unsigned long long)why[2].load(), (unsigned long long)why[3].load(), (unsigned long long)why[4].load(), (unsigned long long)why[5].load(), (unsigned long long)why[6].load(), (unsigned long long)why[7].load(), (unsigned long long)why[8].load());
+    }
     const auto saved = std::span(original).subspan(static_cast<std::size_t>(address - descriptor.baseAddress), bytes);
     if (GuestMemory::EqualsCommittedUnsynced(address, saved)) {
         std::fill(changed.begin(), changed.end(), GuestMemory::BlockUnchanged);

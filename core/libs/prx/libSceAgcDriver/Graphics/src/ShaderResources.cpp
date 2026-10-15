@@ -115,7 +115,30 @@ struct CachedTexture {
     std::uint64_t accounted = 0;
     std::uint64_t present = 0;
     std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> committed;
+    // What vouched for nothing writing the snapshot's memory when it last compared equal, for memory
+    // the write watch does not answer for (see untrackedSnapshotStamp); all zero while there is none.
+    std::array<std::uint64_t, 5> comparedStamp{};
 };
+
+// Memory kept out of the write watch (a Windows host import, or memory never watched) leaves
+// UnchangedSince no answer, so a snapshot over it was compared on every lookup. The stamp
+// StorageTexture::compareUntracked memoizes its compare on vouches for it here too: the write-watch
+// hints an import keeps (CPU stores; without them, the collect epoch, which moves at every
+// submission and every point where the title may have synchronized with the GPU, as the collect
+// memo assumes), the driver's own stamps and the recorder's pending write notes (GPU stores), and the
+// forget serial (remaps). While all of them are what they were when the snapshot last compared
+// equal, the bytes are unchanged. The first word is zero when there is no epoch or a forget is
+// running. APS5_NO_SNAPSHOT_STAMP=1 compares every time, as before.
+std::array<std::uint64_t, 5> untrackedSnapshotStamp(std::uint64_t address, std::size_t bytes) {
+    static const bool disabled = std::getenv("APS5_NO_SNAPSHOT_STAMP") != nullptr;
+    const auto epoch = GuestMemory::CollectEpoch();
+    if (disabled || epoch == 0) return {};
+    const auto hint = GuestMemory::UntrackedHint(address, bytes);
+    const auto forget = GuestMemory::ForgetSerial();
+    if ((forget & 1u) != 0) return {};
+    const auto* recorder = Recorder::Active();
+    return {hint != 0 ? 1u : 2u, hint != 0 ? hint : epoch, GuestMemory::NewestStamp(address, bytes), forget, recorder != nullptr ? recorder->NewestWriteNote(address, bytes) : 0};
+}
 
 // Entries in use order (front = most recent) with a hash index by key: a lookup is O(1) and the
 // eviction takes the back. APS5_NO_TEXTURE_HASH=1 finds entries by scanning the list (the index is
@@ -340,6 +363,11 @@ struct TextureCounters {
     std::atomic<std::uint64_t> ownRefreshes{0};
     std::atomic<std::uint64_t> tablesReused{0};
     std::atomic<std::uint64_t> tablesResolved{0};
+    // Snapshot hits over unwatched memory answered by untrackedSnapshotStamp instead of a compare.
+    std::atomic<std::uint64_t> stampedHits{0};
+    // Snapshot hits over watched memory proven by comparing only the blocks stamped since the snapshot.
+    std::atomic<std::uint64_t> blockCompares{0};
+    std::atomic<std::uint64_t> blockBytesSkipped{0};
     std::atomic<std::int64_t> lastReport{0};
 };
 
@@ -356,7 +384,7 @@ void reportTextureCounters() {
     auto last = counters.lastReport.load();
     if (nowMs - last < 10000 || !counters.lastReport.compare_exchange_strong(last, nowMs)) return;
     const auto count = [](const std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.load(std::memory_order_relaxed)); };
-    AgcDriver::ProfilePrint_nid_no_patch("[textures] sampled created: %llu from storage images, %llu snapshots (%llu snapshot reads over recorded writes inside cachedTexture, %llu storage-path fallbacks); stage-A records %llu: %llu fast hits, %llu full lookups; storage images %llu hits, %llu created, %llu own-object refreshes; image tables %llu reused, %llu resolved\n", count(counters.fromStorage), count(counters.snapshots), count(counters.pendingReads), count(counters.storageFallbacks), count(counters.records), count(counters.fastHits), count(counters.fastMisses), count(counters.storageHits), count(counters.storageCreated), count(counters.ownRefreshes), count(counters.tablesReused), count(counters.tablesResolved));
+    AgcDriver::ProfilePrint_nid_no_patch("[textures] sampled created: %llu from storage images, %llu snapshots (%llu snapshot reads over recorded writes inside cachedTexture, %llu storage-path fallbacks); stage-A records %llu: %llu fast hits, %llu full lookups; storage images %llu hits, %llu created, %llu own-object refreshes; image tables %llu reused, %llu resolved; snapshot hits proven by stamps %llu, by stamped blocks %llu (%llu MiB not compared)\n", count(counters.fromStorage), count(counters.snapshots), count(counters.pendingReads), count(counters.storageFallbacks), count(counters.records), count(counters.fastHits), count(counters.fastMisses), count(counters.storageHits), count(counters.storageCreated), count(counters.ownRefreshes), count(counters.tablesReused), count(counters.tablesResolved), count(counters.stampedHits), count(counters.blockCompares), count(counters.blockBytesSkipped) >> 20u);
 }
 
 // What the sampled-texture lookups on this thread proved their returned objects current against,
@@ -684,7 +712,49 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
                 if (it->committed != committed) return false;
                 return committed.has_value() ? !Recorder::SnapshotWriteOverlaps(address, it->bytes.size()) && GuestMemory::UnchangedCommittedSince(*committed, it->generation) : GuestMemory::UnchangedSince(address, it->bytes.size(), it->generation);
             };
-            if ((*keys != DccKeys::Uncompressed && *keys != DccKeys::ClearSingle) || unchanged() || equalsCommitted()) {
+            const auto stampedEqual = [&] {
+                if (it->committed.has_value() || committed.has_value()) return equalsCommitted();
+                const auto stamp = untrackedSnapshotStamp(address, it->bytes.size());
+                if (stamp[0] != 0 && stamp == it->comparedStamp) {
+                    counters.stampedHits.fetch_add(1, std::memory_order_relaxed);
+                    return true;
+                }
+                if (it->generation != 0) {
+                    // Watched memory stamped since the snapshot (a neighbour's store sharing its
+                    // blocks, a partial upload): only the 64 KiB blocks stamped since compare. The
+                    // flush first, so pending results land (and stamp) before the blocks are read.
+                    // APS5_NO_SNAPSHOT_BLOCKS=1 compares the whole surface, as before.
+                    static const bool wholeCompare = std::getenv("APS5_NO_SNAPSHOT_BLOCKS") != nullptr;
+                    const auto size = it->bytes.size();
+                    const auto blocks = static_cast<std::size_t>((address + size - 1) / 65536 - address / 65536 + 1);
+                    thread_local std::vector<std::uint64_t> blockGenerations;
+                    thread_local std::vector<std::uint8_t> blockChanged;
+                    blockGenerations.assign(blocks, it->generation);
+                    blockChanged.assign(blocks, GuestMemory::BlockWritten);
+                    if (!wholeCompare) {
+                        if (Recorder::SnapshotWriteOverlaps(address, size)) counters.pendingReads.fetch_add(1, std::memory_order_relaxed);
+                        const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::TextureCompare);
+                        GuestMemory::FlushGpuWrites(address, size);
+                        if (GuestMemory::ChangedBlocks(address, size, blockGenerations, blockChanged)) {
+                            std::size_t written = 0;
+                            for (std::size_t k = 0; k < blocks; ++k) {
+                                if (blockChanged[k] == GuestMemory::BlockUnchanged) continue;
+                                const auto begin = std::max<std::uint64_t>(address, (address / 65536 + k) * 65536);
+                                const auto end = std::min<std::uint64_t>(address + size, (address / 65536 + k + 1) * 65536);
+                                written += static_cast<std::size_t>(end - begin);
+                                if (!GuestMemory::EqualsCommittedUnsynced(begin, std::span<const std::byte>(it->bytes).subspan(static_cast<std::size_t>(begin - address), static_cast<std::size_t>(end - begin)))) return false;
+                            }
+                            counters.blockCompares.fetch_add(1, std::memory_order_relaxed);
+                            counters.blockBytesSkipped.fetch_add(size - written, std::memory_order_relaxed);
+                            return true;
+                        }
+                    }
+                }
+                if (!equalsCommitted()) return false;
+                it->comparedStamp = stamp;
+                return true;
+            };
+            if ((*keys != DccKeys::Uncompressed && *keys != DccKeys::ClearSingle) || unchanged() || stampedEqual()) {
                 it->generation = snapshotGeneration;
                 it->committed = std::move(committed);
                 touchTexture(cache, it);

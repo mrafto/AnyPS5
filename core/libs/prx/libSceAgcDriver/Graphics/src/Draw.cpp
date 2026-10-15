@@ -1006,6 +1006,10 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
     Require(draw.indexed ? draw.flags == 0 : (draw.flags & ~0x20u) == 0, "draw modifiers are unsupported");
     if (draw.indexed) {
         Require(draw.indexSize == 2 || draw.indexSize == 4, "only uint16 and uint32 index buffers are supported");
+        if (args == nullptr && (draw.indexCount == 0 || draw.instanceCount == 0)) {
+            inputs.nothing = true;
+            return inputs;
+        }
     } else {
         Require(draw.indexAddress == 0 && draw.indexSize == 0, "auto draw must not reference an index buffer");
         if (args == nullptr) {

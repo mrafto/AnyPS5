@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <list>
 #include <mutex>
+#include <string>
 #include <string_view>
 #include <type_traits>
 #include <unordered_map>
@@ -174,12 +175,21 @@ void appendKey(std::vector<std::byte>& key, const TValue& value) {
     key.insert(key.end(), bytes.begin(), bytes.end());
 }
 
-bool libraryKeys(PipelineLibraryKeys& keys, const Context& context, const State& state, const VertexInputLayout& input, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders) {
+bool libraryKeys(PipelineLibraryKeys& keys, const Context& context, const State& state, const VertexInputLayout& input, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders, const char** reason = nullptr) {
     using Stage = ShaderRecompiler::ShaderStage;
-    if (!context.graphicsPipelineLibrary || context.pipelineExecutableInfo || state.depthBiasPerFace || state.rectList || SplitsAlternateAlpha(state)) return false;
+    const auto refuse = [&](const char* why) {
+        if (reason != nullptr) *reason = why;
+        return false;
+    };
+    if (!context.graphicsPipelineLibrary) return refuse("no-gpl");
+    if (context.pipelineExecutableInfo) return refuse("exec-info");
+    if (state.depthBiasPerFace) return refuse("depth-bias-per-face");
+    if (state.rectList) return refuse("rect-list");
+    if (SplitsAlternateAlpha(state)) return refuse("alternate-alpha");
     keys = {};
     for (const auto& shader : shaders) {
-        if (shader.stage == Stage::Geometry || shader.program->PipelineVariantId() == 0) return false;
+        if (shader.stage == Stage::Geometry) return refuse("geometry");
+        if (shader.program->PipelineVariantId() == 0) return refuse("no-variant-id");
         auto& key = shader.stage == Stage::Fragment ? keys.fragmentShader : keys.preRasterization;
         appendKey(key, shader.stage);
         appendKey(key, shader.program->PipelineVariantId());
@@ -273,6 +283,7 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
 
 Pipeline::Pipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) : context(context), _modules(shaders.size()), attachments(state.colors.size() + (state.depth ? 1u : 0u)), colorAttachments(state.colors.size()), depthBounds(state.depth.has_value() && state.depthBoundsTest), depthBias(state.depth.has_value() && state.depthBias), dynamicRendering(context.graphicsPipelineLibrary) {
     PerformanceTimer timing("Vulkan.GraphicsPipeline");
+    const auto constructionStart = std::chrono::steady_clock::now();
     sampleLocationsEnabled = ValidateSampleLocations(context, state);
     // A cached pipeline may outlive its device's teardown (see ClearCachedPipelines); it must not keep
     // the buffer pool, which is reset with the device, alive past it.
@@ -410,7 +421,8 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
         viewports.viewportCount = 1;
         viewports.scissorCount = 1;
         PipelineLibraryKeys keys;
-        libraries = libraryKeys(keys, context, state, vertexInput, resources, shaders);
+        const char* libraryRefusal = nullptr;
+        libraries = libraryKeys(keys, context, state, vertexInput, resources, shaders, &libraryRefusal);
         std::vector<VkDynamicState> dynamicStates{VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
         if (depthBounds) dynamicStates.push_back(VK_DYNAMIC_STATE_DEPTH_BOUNDS);
         if (depthBias) dynamicStates.push_back(VK_DYNAMIC_STATE_DEPTH_BIAS);
@@ -529,6 +541,15 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
         _modules.clear();
         timing.Mark("create");
         LogPipelineStatistics_nid_no_patch(context, pipeline);
+        static const bool profileSlow = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+        if (profileSlow) {
+            const auto elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - constructionStart).count();
+            if (elapsed > 20.0) {
+                std::string stageKinds;
+                for (const auto& shader : shaders) stageKinds += std::to_string(static_cast<int>(shader.stage)) + ",";
+                AgcDriver::ProfilePrint_nid_no_patch("[pipeslow] %.1f ms path=%s refusal=%s stages=%s rectList=%d samples=%u depthBiasPerFace=%d altAlpha=%d tess=%d mesh=%d\n", elapsed, libraries ? "library-link" : "full-create", libraries ? "-" : (libraryRefusal != nullptr ? libraryRefusal : "?"), stageKinds.c_str(), static_cast<int>(state.rectList), static_cast<unsigned>(state.samples), static_cast<int>(state.depthBiasPerFace), static_cast<int>(alternateAlpha), static_cast<int>(state.stages.tessellation.has_value()), static_cast<int>(state.stages.mesh.has_value()));
+            }
+        }
     } catch (...) {
         release();
         throw;

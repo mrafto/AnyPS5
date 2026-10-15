@@ -62,6 +62,8 @@ struct ImageMirror {
     bool writable = false;
     bool heap = false;
     bool sparse = false;
+    // A heap mirror whose range lost its write tracking: refreshed by comparing every block, and replaced by an import when one fits.
+    bool unwatched = false;
     std::uint64_t reserved = 0;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> committed;
     std::vector<std::uint64_t> generations;
@@ -960,6 +962,10 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
         static auto lastReport = std::chrono::steady_clock::now() - std::chrono::seconds(60);
         ++refused;
         refusedBytes += bytes;
+        {
+            static int shown = 0;
+            if (shown++ < 12) std::fprintf(stderr, "[dbg] import refused 0x%llx+0x%llx joined=%d evict=%d live=%llu replaced=%llu evictable=%llu budget=%llu MiB\n", static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), joined, evict, static_cast<unsigned long long>(state.liveBytes >> 20u), static_cast<unsigned long long>(replaced >> 20u), static_cast<unsigned long long>(evictableBytes(state, base, base + bytes) >> 20u), static_cast<unsigned long long>(budget >> 20u));
+        }
         if (std::chrono::steady_clock::now() - lastReport > std::chrono::seconds(10)) {
             lastReport = std::chrono::steady_clock::now();
             std::fprintf(stderr, "[gpu] host import budget: %llu MiB live of %llu MiB (APS5_HOST_IMPORT_MIB); %llu imports (%llu MiB) refused so far, last 0x%llx+0x%llx\n", static_cast<unsigned long long>(state.liveBytes >> 20u), static_cast<unsigned long long>(budget >> 20u), static_cast<unsigned long long>(refused), static_cast<unsigned long long>(refusedBytes >> 20u), static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes));
@@ -1285,6 +1291,7 @@ struct RefreshBlock {
 
 constexpr std::uint8_t SparseCopy = 1;
 constexpr std::uint8_t SparseZero = 2;
+constexpr std::uint8_t CompareCopy = 3;
 
 // Compares a block's guest bytes with the mirror's shadow and copies a changed block into the device
 bool compareBlock(const RefreshBlock& block) {
@@ -1292,6 +1299,11 @@ bool compareBlock(const RefreshBlock& block) {
     const auto* guest = reinterpret_cast<const std::byte*>(block.address);
     if (block.fill != 0) {
         auto* target = block.mirror->buffer->Bytes().data() + offset;
+        if (block.fill == CompareCopy) {
+            if (std::memcmp(target, guest, block.length) == 0) return false;
+            std::memcpy(target, guest, block.length);
+            return true;
+        }
         if (block.fill == SparseZero) std::memset(target, 0, block.length);
         else std::memcpy(target, guest, block.length);
         return true;
@@ -1479,6 +1491,26 @@ void appendChangedBlocks(std::span<ImageMirror* const> mirrors, std::uint64_t ge
     }
 }
 
+// A heap mirror whose range lost its write tracking (a host import now overlaps it, or part of it was remapped)
+// cannot tell which blocks changed: every block is compared with the mirror and copied when it differs.
+void appendAllBlocks(std::span<ImageMirror* const> mirrors, std::vector<RefreshBlock>& blocks) {
+    constexpr std::uint64_t block = 65536;
+    auto& state = Mirrors();
+    state.heapChecks += mirrors.size();
+    for (auto* const pointer : mirrors) {
+        auto& mirror = *pointer;
+        const auto aligned = mirror.base / block * block;
+        const auto end = mirror.base + mirror.bytes;
+        ++state.heapUnwatched;
+        mirror.unwatched = true;
+        for (auto at = mirror.base; at < end;) {
+            const auto next = std::min(end, (at - aligned) / block * block + aligned + block);
+            blocks.push_back({&mirror, at, static_cast<std::size_t>(next - at), 0, CompareCopy});
+            at = next;
+        }
+    }
+}
+
 void refreshHeapMirrors(std::vector<ImageMirror*>& mirrors, std::vector<RefreshBlock>& blocks) {
     std::sort(mirrors.begin(), mirrors.end(), [](const ImageMirror* left, const ImageMirror* right) { return left->base < right->base; });
     for (std::size_t first = 0; first < mirrors.size();) {
@@ -1488,8 +1520,9 @@ void refreshHeapMirrors(std::vector<ImageMirror*>& mirrors, std::vector<RefreshB
         const auto bytes = mirrors[last - 1]->base + mirrors[last - 1]->bytes - begin;
         prepareRange(begin, bytes);
         const auto generation = GuestMemory::CollectWrites(begin, static_cast<std::size_t>(bytes));
-        Require(generation != 0, "a heap mirror's range is no longer write-watched");
-        appendChangedBlocks(std::span<ImageMirror* const>(mirrors).subspan(first, last - first), generation, blocks);
+        const auto group = std::span<ImageMirror* const>(mirrors).subspan(first, last - first);
+        if (generation == 0) appendAllBlocks(group, blocks);
+        else appendChangedBlocks(group, generation, blocks);
         first = last;
     }
 }
@@ -1590,7 +1623,7 @@ bool refreshSparseMirror(ImageMirror& mirror, std::vector<RefreshBlock>& blocks)
     if (!pieces.empty() && pieces.back().second > mirror.base + mirror.bytes) return false;
     syncRange(mirror.base, mirror.bytes);
     const auto generation = collectPieces(pieces);
-    Require(generation != 0, "a sparse heap mirror's range is no longer write-watched");
+    if (generation == 0) return false;
     appendSparseBlocks(mirror, std::move(pieces), generation, blocks);
     return true;
 }
@@ -1625,9 +1658,10 @@ std::vector<std::pair<std::size_t, std::uint64_t>> refreshHeapRuns(const GuestBu
         const auto& run = space.heapRuns[index];
         prepareRange(run.begin, run.bytes);
         const auto generation = GuestMemory::CollectWrites(run.begin, static_cast<std::size_t>(run.bytes));
-        Require(generation != 0, "a heap mirror's range is no longer write-watched");
+        const auto group = std::span<ImageMirror* const>(space.heapMirrors).subspan(run.first, run.last - run.first);
         const auto since = space.verified[index].load(std::memory_order_relaxed);
-        if (since == 0 || !GuestMemory::UnchangedSince(run.begin, static_cast<std::size_t>(run.bytes), since)) appendChangedBlocks(std::span<ImageMirror* const>(space.heapMirrors).subspan(run.first, run.last - run.first), generation, blocks);
+        if (generation == 0) appendAllBlocks(group, blocks);
+        else if (since == 0 || !GuestMemory::UnchangedSince(run.begin, static_cast<std::size_t>(run.bytes), since)) appendChangedBlocks(group, generation, blocks);
         checked.emplace_back(index, generation);
     }
     return checked;
@@ -1739,6 +1773,50 @@ std::shared_ptr<ImageMirror> acquireMirror(const Context& context, const std::sh
     state.entries[range->address] = mirror;
     ++state.version;
     return mirror;
+}
+
+// Registered ranges of at least APS5_LAZY_RANGE_MIB (default 1024; 0 turns it off) stay out of the BDA table until a
+// shader first reads one: a title registers heaps larger than the driver can pin or the device can mirror, most of
+// which no shader touches. The first read faults once (the dispatch's result is lost, as for any unmapped address),
+// then the range is mapped like any other.
+struct LazyRanges {
+    std::mutex mutex;
+    std::map<std::uint64_t, std::uint64_t> deferred;
+    std::set<std::uint64_t> needed;
+};
+
+LazyRanges& Lazy() {
+    static LazyRanges* const state = new LazyRanges;
+    return *state;
+}
+
+std::uint64_t lazyRangeBytes() {
+    static const std::uint64_t bytes = [] {
+        const char* value = std::getenv("APS5_LAZY_RANGE_MIB");
+        return (value != nullptr ? std::strtoull(value, nullptr, 10) : 1024ull) << 20u;
+    }();
+    return bytes;
+}
+
+bool lazyRangeWaiting(const GuestAllocations::Range& range, bool record) {
+    const auto threshold = lazyRangeBytes();
+    if (threshold == 0 || range.bytes < threshold) return false;
+    auto& state = Lazy();
+    std::lock_guard lock(state.mutex);
+    if (state.needed.contains(range.address)) return false;
+    if (record) state.deferred[range.address] = range.bytes;
+    return true;
+}
+
+bool deferLazyRange(const GuestAllocations::Range& range) {
+    return lazyRangeWaiting(range, true);
+}
+
+bool mirrorUnwatched(std::uint64_t address) {
+    auto& state = Mirrors();
+    std::lock_guard lock(state.mutex);
+    const auto found = state.entries.find(address);
+    return found != state.entries.end() && found->second->unwatched;
 }
 
 bool mirrorUnmappable(std::uint64_t address) {
@@ -2088,6 +2166,26 @@ MirrorStats MirrorCounters() {
     return stats;
 }
 
+bool NoteDeferredRangeAccess(std::uint64_t address) {
+    auto& state = Lazy();
+    std::uint64_t base = 0;
+    std::uint64_t bytes = 0;
+    {
+        std::lock_guard lock(state.mutex);
+        auto found = state.deferred.upper_bound(address);
+        if (found == state.deferred.begin()) return false;
+        --found;
+        if (address - found->first >= found->second) return false;
+        base = found->first;
+        bytes = found->second;
+        if (!state.needed.insert(base).second) return false;
+        state.deferred.erase(found);
+    }
+    std::fprintf(stderr, "[gpu] a shader read 0x%llx in the registered range 0x%llx+0x%llx, kept out of the address table until used; mapping it from the next build (this dispatch's result is lost)\n", static_cast<unsigned long long>(address), static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes));
+    Spaces().current.store(nullptr);
+    return true;
+}
+
 void ClearImageMirrors(VkDevice device) {
     auto space = Spaces().current.load();
     if (space != nullptr && space->device == device) {
@@ -2358,7 +2456,7 @@ bool ImportMappedRanges(const Context& context, const GuestAllocations::Mapped& 
     if (!adopting) current = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
     for (const auto& mapped : ranges) {
         const auto range = mapped.lock();
-        if (range == nullptr || leasedRangeOwner(current, range->address) != range) continue;
+        if (range == nullptr || leasedRangeOwner(current, range->address) != range || lazyRangeWaiting(*range, false)) continue;
         try {
             if (!GuestMemory::GpuMutex().HeldByThisThread()) {
                 const auto run = importRun(current, range->address);
@@ -2530,13 +2628,14 @@ void GuestBufferMemory::AcquireRegistered() {
         std::vector<std::uint64_t> imported;
         for (const auto& range : lease) {
             if (!range->readable || !range->gpu) continue;
+            if (deferLazyRange(*range)) continue;
             validate(range->address, range->bytes);
             Region region{range->address, range->address + range->bytes, range->writable, {}, nullptr};
             const HostImport* entry = nullptr;
             if (importable) {
                 auto& state = Imports();
                 std::lock_guard lock(state.mutex);
-                entry = importAllocation(context, state, range->address, lease, 0, false);
+                entry = importAllocation(context, state, range->address, lease, 0, range->bytes >= (64ull << 20u) && mirrorUnwatched(range->address));
             }
             lap(timing.importsUs, at);
             if (entry != nullptr) {
@@ -3178,7 +3277,14 @@ void GuestBufferMemory::UploadPrepare(bool addressable) {
                 previous.end = std::max(previous.end, region.end);
                 continue;
             }
-            Require(previous.writable == region.writable, "writable guest memory overlaps an immutable snapshot");
+            if (previous.writable != region.writable) {
+                // Live guest bytes (a descriptor range inside a registered range kept out of the table until used)
+                // overlap a snapshot captured at compile time: the live bytes serve both, as for a host-backed range.
+                previous.writable = true;
+                previous.snapshot.clear();
+                previous.end = std::max(previous.end, region.end);
+                continue;
+            }
             if (!region.writable) {
                 const auto offset = static_cast<std::size_t>(region.begin - previous.begin);
                 const auto overlap = static_cast<std::size_t>(std::min(previous.end, region.end) - region.begin);

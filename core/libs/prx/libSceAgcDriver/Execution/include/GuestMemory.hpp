@@ -109,6 +109,13 @@ std::uint64_t CollectWritesUncached(std::uint64_t address, std::size_t bytes);
 std::uint64_t TrackerGeneration();
 std::uint64_t NewestStamp(std::uint64_t address, std::size_t bytes);
 std::uint64_t UntrackedHint(std::uint64_t address, std::size_t bytes);
+// Per 64 KiB block of a range kept out of the write watch that keeps write-watch hints (a Windows
+// host import; block 0 holds `address`): whether the CPU (a hint) or the driver (MarkWritten, which
+// stamps such memory in the unstamped-store table at record time) wrote it after `since`, a
+// TrackerGeneration value read before the content was last known. `cpu` says whether any block was
+// written by the CPU. False when the range keeps no hints (the caller compares bytes). Recorded GPU
+// work still writing the range is the caller's to add (Recorder::PendingWritesOver).
+bool UntrackedChangedBlocks(std::uint64_t address, std::size_t bytes, std::uint64_t since, std::span<std::uint8_t> changed, bool& cpu);
 // Whether no CPU write touched the range since `generation`: an uncached resetting collect of the
 // range's pages first (a game store not collected yet becomes a block stamp), then the compare over
 // the stamps collects make (dirty pages), not the MarkWritten stamps of the driver's own GPU label

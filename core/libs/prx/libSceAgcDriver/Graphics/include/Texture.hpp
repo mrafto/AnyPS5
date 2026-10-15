@@ -509,6 +509,10 @@ private:
     SurfaceGeometry geometry;
     std::vector<std::byte> original;
     mutable std::array<std::uint64_t, 5> comparedGuestBytes{};
+    // Memory outside the write watch (a Windows host import): the tracker generation read before the
+    // last Refresh took the guest bytes in, and the forget serial then (see Refresh's untrackedBlocks).
+    std::uint64_t untrackedSince = 0;
+    std::uint64_t untrackedForget = 0;
     std::vector<std::byte> generationBaseline;
     // DCC keys the image content was uploaded under: a fast-cleared surface starts as its clear value.
     DccKeys uploadedKeys = DccKeys::Uncompressed;
