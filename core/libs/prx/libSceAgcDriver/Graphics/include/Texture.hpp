@@ -362,6 +362,10 @@ private:
     void captureGuestBytes(const std::vector<bool>* layers);
     bool originalHolds(std::uint64_t address, std::size_t bytes) const;
     bool compareUntracked(std::uint64_t address, std::size_t bytes, std::span<std::uint8_t> changed, bool memoize = false) const;
+    // Memory outside the write watch that keeps hints: whether nothing (no CPU store, no driver
+    // store, no recorded GPU write still pending) wrote [address, address + bytes) since the last
+    // Refresh took the guest bytes in, so a compare with `original` would find every block equal.
+    bool untrackedQuiet(std::uint64_t address, std::size_t bytes) const;
     // Stores the pending tracked layers overlapping [address, address + bytes) to guest memory; in
     // each, 64 KiB blocks the CPU wrote since the layer's generation keep the CPU's bytes. Block
     // units asked for in pieces too often are all stored at once for a while (the hysteresis:

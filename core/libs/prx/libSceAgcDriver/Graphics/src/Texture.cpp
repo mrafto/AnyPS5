@@ -94,6 +94,8 @@ std::atomic<std::uint64_t> refreshesProved{0};
 std::atomic<std::uint64_t> untrackedCompares{0};
 // Refreshes of memory outside the write watch that took their changed blocks from stamps (no compare).
 std::atomic<std::uint64_t> untrackedStampRefreshes{0};
+// Write-back runs outside the write watch whose compare untrackedQuiet made unnecessary.
+std::atomic<std::uint64_t> untrackedQuietWriteBacks{0};
 
 struct StorageTraffic {
     std::mutex mutex;
@@ -2144,6 +2146,19 @@ bool StorageTexture::originalHolds(std::uint64_t address, std::size_t bytes) con
     return true;
 }
 
+bool StorageTexture::untrackedQuiet(std::uint64_t address, std::size_t bytes) const {
+    static const bool disabled = std::getenv("APS5_NO_UNTRACKED_STAMPS") != nullptr;
+    if (disabled || untrackedSince == 0 || bytes == 0) return false;
+    const auto forget = GuestMemory::ForgetSerial();
+    if ((forget & 1u) != 0 || forget != untrackedForget) return false;
+    if (const auto* recorder = Recorder::Active(); recorder != nullptr && recorder->PendingWriteOverlaps(address, bytes)) return false;
+    thread_local std::vector<std::uint8_t> blocks;
+    blocks.assign(static_cast<std::size_t>((address + bytes - 1) / 65536 - address / 65536 + 1), GuestMemory::BlockWritten);
+    bool cpu = false;
+    if (!GuestMemory::UntrackedChangedBlocks(address, bytes, untrackedSince, blocks, cpu) || cpu) return false;
+    return std::all_of(blocks.begin(), blocks.end(), [](std::uint8_t value) { return value == GuestMemory::BlockUnchanged; });
+}
+
 bool StorageTexture::compareUntracked(std::uint64_t address, std::size_t bytes, std::span<std::uint8_t> changed, bool memoize) const {
     if (!originalHolds(address, bytes)) return false;
     struct Exempt {
@@ -2181,7 +2196,7 @@ bool StorageTexture::compareUntracked(std::uint64_t address, std::size_t bytes, 
         else for (int k = 0; k < 5; ++k) if (stamp[k] != comparedGuestBytes[k]) { ++why[4 + k]; break; }
         const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
         auto last = whyLast.load();
-        if (nowMs - last > 10000 && whyLast.compare_exchange_strong(last, nowMs)) std::fprintf(stderr, "[dbg] untracked stamp refreshes %llu misses: nomemo %llu partial %llu epoch0 %llu forget %llu | kind %llu hint/epoch %llu stamp %llu forget %llu note %llu\n", (unsigned long long)why[0].load(), (unsigned long long)why[1].load(), (unsigned long long)why[2].load(), (unsigned long long)why[3].load(), (unsigned long long)why[4].load(), (unsigned long long)why[5].load(), (unsigned long long)why[6].load(), (unsigned long long)why[7].load(), (unsigned long long)why[8].load());
+        if (nowMs - last > 10000 && whyLast.compare_exchange_strong(last, nowMs)) std::fprintf(stderr, "[dbg] untracked stamp refreshes %llu quiet write-backs %llu misses: nomemo %llu partial %llu epoch0 %llu forget %llu | kind %llu hint/epoch %llu stamp %llu forget %llu note %llu\n", (unsigned long long)untrackedStampRefreshes.load(), (unsigned long long)untrackedQuietWriteBacks.load(), (unsigned long long)why[0].load(), (unsigned long long)why[1].load(), (unsigned long long)why[2].load(), (unsigned long long)why[3].load(), (unsigned long long)why[4].load(), (unsigned long long)why[5].load(), (unsigned long long)why[6].load(), (unsigned long long)why[7].load(), (unsigned long long)why[8].load());
     }
     const auto saved = std::span(original).subspan(static_cast<std::size_t>(address - descriptor.baseAddress), bytes);
     if (GuestMemory::EqualsCommittedUnsynced(address, saved)) {
@@ -4632,7 +4647,15 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         for (const auto& [begin, end] : unitRuns(saved)) {
             const auto from = descriptor.baseAddress + begin;
             const auto last = descriptor.baseAddress + end - 1;
-            if (!compareUntracked(from, static_cast<std::size_t>(end - begin), std::span(changedBlocks).subspan(static_cast<std::size_t>((from - spanBegin) / block), static_cast<std::size_t>(last / block - from / block + 1)))) continue;
+            const auto runBlocks = std::span(changedBlocks).subspan(static_cast<std::size_t>((from - spanBegin) / block), static_cast<std::size_t>(last / block - from / block + 1));
+            // Nothing wrote the run since the last Refresh took it in: the compare would find every
+            // block equal to `original`, so it is skipped with its wait for the GPU (see untrackedQuiet).
+            if (untrackedQuiet(from, static_cast<std::size_t>(end - begin))) {
+                std::fill(runBlocks.begin(), runBlocks.end(), GuestMemory::BlockUnchanged);
+                untrackedQuietWriteBacks.fetch_add(1, std::memory_order_relaxed);
+            } else if (!compareUntracked(from, static_cast<std::size_t>(end - begin), runBlocks)) {
+                continue;
+            }
             for (auto layer = static_cast<std::uint32_t>(begin / trackedLayerBytes); layer < trackedLayers && layerBegin(layer) <= last; ++layer) compared[layer] = true;
         }
     }
