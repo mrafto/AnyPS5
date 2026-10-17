@@ -2816,8 +2816,6 @@ bool CompletePendingCpuWrites(const Context& context, std::uint64_t address, std
         return std::any_of(writers.begin(), writers.end(), [&](const auto& writer) { return writer->WritesOverlap(address, bytes); });
     };
     static const bool readersWait = std::getenv("APS5_READERS_WAIT_COMPLETION_LABELS") != nullptr;
-    // A label stored on the GPU (not deferred behind a completion) is ordered ahead of in-place GPU work on
-    // its queue, writers included; only a label whose store waits for the completion can race one.
     static const bool writersWaitAll = std::getenv("APS5_WRITERS_WAIT_ALL_LABELS") != nullptr;
     const bool labelWait = labels && (readOnly ? readersWait && recorder->PendingLabelIn(address, bytes) : (writersWaitAll ? recorder->PendingLabelIn(address, bytes) : recorder->CompletionLabelIn(address, bytes)));
     const bool copiedOverlap = context.copiedWriters != nullptr && overlaps(*context.copiedWriters);
@@ -2829,16 +2827,11 @@ bool CompletePendingCpuWrites(const Context& context, std::uint64_t address, std
             recorder->SyncThrough(address, bytes);
             return true;
         }
-        // Per trigger (copied writer, draw writer, label): syncs, wall time, bytes covered, and how many were read-only.
         struct Reason {
             std::atomic<std::uint64_t> syncs{0}, micros{0}, bytes{0}, readOnly{0};
         };
         static Reason reasons[3];
         static std::atomic<std::int64_t> lastReport{0};
-        static std::atomic<int> sampled{0};
-        if (labelWait && !copiedOverlap && !drawOverlap && sampled.load(std::memory_order_relaxed) < 400 && sampled.fetch_add(1, std::memory_order_relaxed) % 8 == 0) {
-            AgcDriver::ProfilePrint_nid_no_patch("[cpu-write-sync] sample label wait %llx+%llx caller %p\n", static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes), __builtin_return_address(0));
-        }
         const auto begin = std::chrono::steady_clock::now();
         recorder->SyncThrough(address, bytes);
         const auto end = std::chrono::steady_clock::now();

@@ -1144,9 +1144,11 @@ bool collectWindowsWrites(StampRuns& runs, std::uint64_t first, std::uint64_t st
         while (cursor < stop) {
             std::size_t count = tracker.pages.size();
             if (!collect(cursor, static_cast<std::size_t>(stop - cursor), tracker.pages.data(), &count, clear)) return false;
-            for (std::size_t i = 0; i < count; ++i) {
-                const auto page = reinterpret_cast<std::uintptr_t>(tracker.pages[i]);
-                stampWrittenRun(&runs, page, page + WritePageBytes);
+            for (std::size_t i = 0; i < count;) {
+                const auto first = reinterpret_cast<std::uintptr_t>(tracker.pages[i]);
+                auto stopPage = first + WritePageBytes;
+                while (++i < count && reinterpret_cast<std::uintptr_t>(tracker.pages[i]) == stopPage) stopPage += WritePageBytes;
+                stampWrittenRun(&runs, first, stopPage);
             }
             if (count < tracker.pages.size()) break;
             cursor = reinterpret_cast<std::uintptr_t>(tracker.pages[count - 1]) + WritePageBytes;
