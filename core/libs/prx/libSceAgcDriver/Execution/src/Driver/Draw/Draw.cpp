@@ -137,7 +137,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                 if (dataEntry != nullptr) ++drawEntryCounters.dataHits;
             }
         }
-        if (traceDrawCache()) traceDrawKeyLookup(drawKeyComponents, found == drawCache.end());
+        if (traceDrawCache()) traceDrawKeyLookup(queue, drawKeyComponents, found == drawCache.end());
         if (traceDrawCache()) {
             traceInsert(traceKeysSeen, drawKey);
             traceInsert(traceShapes, shapeKey);

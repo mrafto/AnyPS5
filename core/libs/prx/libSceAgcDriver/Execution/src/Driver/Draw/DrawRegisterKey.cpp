@@ -193,16 +193,35 @@ std::uint64_t Driver::drawRegisterKey(const QueueState& queue, const ShaderRegis
     return key;
 }
 
-void Driver::traceDrawKeyLookup(const std::array<std::uint64_t, 5>& components, bool cacheMiss) {
+void Driver::traceDrawKeyLookup(const QueueState& queue, const std::array<std::uint64_t, 5>& components, bool cacheMiss) {
     if (!traceDrawCache()) return;
-    struct Previous { std::array<std::uint64_t, 4> parts{}; };
+    struct Previous {
+        std::array<std::uint64_t, 4> parts{};
+        std::vector<std::pair<std::uint32_t, std::uint32_t>> words;
+    };
     struct PreviousStorage {};
     auto& previous = HostThreadLocal<std::unordered_map<std::uint64_t, Previous>, PreviousStorage>();
     const auto shaderSet = components[4];
     if (previous.size() >= 2048 && previous.find(shaderSet) == previous.end()) previous.clear();
     const auto [it, inserted] = previous.try_emplace(shaderSet);
-    if (!cacheMiss) { it->second.parts = {components[0], components[1], components[2], components[3]}; return; }
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> words;
+    forEachKeyedUserWord(queue, false, [&](std::uint32_t offset, std::uint32_t value) { words.emplace_back(offset, value); });
+    if (!cacheMiss) {
+        it->second.parts = {components[0], components[1], components[2], components[3]};
+        it->second.words = std::move(words);
+        return;
+    }
     auto& counters = drawEntryCounters;
+    if (!inserted) {
+        for (const auto& [offset, value] : words) {
+            const auto before = std::find_if(it->second.words.begin(), it->second.words.end(), [&](const auto& word) { return word.first == offset; });
+            if (before == it->second.words.end() || before->second == value || offset >= counters.userWordChanges.size()) continue;
+            ++counters.userWordChanges[offset];
+            const auto delta = value > before->second ? value - before->second : before->second - value;
+            if (delta < 0x100000u) ++counters.userWordNearChanges;
+            else ++counters.userWordFarChanges;
+        }
+    }
     if (inserted) ++counters.registerKeyMissChanges[4];
     else {
         bool changed = false;
@@ -210,6 +229,7 @@ void Driver::traceDrawKeyLookup(const std::array<std::uint64_t, 5>& components, 
         if (!changed) ++counters.registerKeyMissChanges[5];
     }
     it->second.parts = {components[0], components[1], components[2], components[3]};
+    it->second.words = std::move(words);
 }
 
 bool Driver::sameVertexInfo(const ShaderRecompiler::ShaderVertexStageInfo& a, const ShaderRecompiler::ShaderVertexStageInfo& b) {
