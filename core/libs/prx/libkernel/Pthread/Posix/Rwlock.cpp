@@ -36,6 +36,8 @@ void initializeStatic(PthreadRwlock* rwlock, const char* funcName) {
 
 extern "C" {
 
+int APS5_VABI pthread_rwlock_wrlock_nid_postfix(PthreadRwlock* rwlock);
+
 int APS5_VABI pthread_rwlock_destroy_nid_postfix(PthreadRwlock* rwlock) {
     if (!rwlock) throw std::runtime_error("pthread_rwlock_destroy: null rwlock");
     if (*rwlock == nullptr) return 0;
@@ -60,7 +62,7 @@ int APS5_VABI pthread_rwlock_rdlock_nid_postfix(PthreadRwlock* rwlock) {
 }
 
 int APS5_VABI pthread_rwlock_timedrdlock_nid_postfix(PthreadRwlock* rwlock, const KernelTimespec* abstime) {
-    if (!abstime) throw std::runtime_error("pthread_rwlock_timedrdlock: null abstime");
+    if (!abstime) return pthread_rwlock_rdlock_nid_postfix(rwlock);
     initializeStatic(rwlock, __func__);
     if (scePthreadRwlockTryrdlock(rwlock) == 0) return 0;
     KernelUseconds usec = 0;
@@ -69,7 +71,7 @@ int APS5_VABI pthread_rwlock_timedrdlock_nid_postfix(PthreadRwlock* rwlock, cons
 }
 
 int APS5_VABI pthread_rwlock_timedwrlock_nid_postfix(PthreadRwlock* rwlock, const KernelTimespec* abstime) {
-    if (!abstime) throw std::runtime_error("pthread_rwlock_timedwrlock: null abstime");
+    if (!abstime) return pthread_rwlock_wrlock_nid_postfix(rwlock);
     initializeStatic(rwlock, __func__);
     if (scePthreadRwlockTrywrlock(rwlock) == 0) return 0;
     KernelUseconds usec = 0;

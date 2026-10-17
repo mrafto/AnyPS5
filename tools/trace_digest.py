@@ -32,7 +32,8 @@ class Trace:
         self.presents = []
         self.folded = collections.defaultdict(float)
         self.batched = []
-        for event in document["traceEvents"]:
+        events = document if isinstance(document, list) else (document.get("traceEvents") or [])
+        for event in events:
             phase = event.get("ph")
             if phase == "M" and event.get("name") == "thread_name":
                 self.threads[event["tid"]] = event["args"]["name"]

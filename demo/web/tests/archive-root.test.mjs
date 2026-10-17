@@ -14,6 +14,37 @@ async function zipped(entries) {
   return writer.close();
 }
 
+const { packageArchive } = await import(pathToFileURL(path.join(process.argv[2], "archive.mjs")));
+const libraryBundle = await zipped([["libs/provider.prx", false]]);
+for (const conflict of ["sce_module/provider.guest.prx/child", "sce_module/PROVIDER.GUEST.PRX/child", "sce_module/provider.guest.prx/"]) {
+  const input = new Archive(await zipped([["main.elf", false], ["sce_module/provider.prx", false], [conflict, conflict.endsWith("/")]]));
+  try {
+    await input.inspect(() => {});
+    const written = [];
+    const destination = {
+      async directory(name) { written.push(name); },
+      async file(name) { written.push(name); return new WritableStream(); }
+    };
+    const converted = { executable: header, modules: [{ name: "app0/sce_module/provider.guest.prx", bytes: header }] };
+    await assert.rejects(packageArchive(input, converted, "main", libraryBundle, destination, () => {}, true), /Output path collision/);
+    assert.deepEqual(written, []);
+  } finally { await input.close(); }
+}
+
+const distinctOutput = new Archive(await zipped([["main.elf", false], ["sce_module/provider.prx", false], ["assets/", true]]));
+try {
+  await distinctOutput.inspect(() => {});
+  const written = [];
+  await packageArchive(distinctOutput, { executable: header, modules: [{ name: "app0/sce_module/provider.guest.prx", bytes: header }] },
+    "main", libraryBundle, {
+      async directory(name) { written.push(name); },
+      async file(name) { written.push(name); return new WritableStream(); }
+    }, () => {}, true);
+  assert(written.includes("app0/assets/"));
+  assert(written.includes("app0/sce_module/provider.guest.prx"));
+  assert(written.includes("libs/provider.prx"));
+} finally { await distinctOutput.close(); }
+
 const metadata = new Uint8Array(86);
 const metadataView = new DataView(metadata.buffer);
 metadataView.setUint32(0, 0x00051607);

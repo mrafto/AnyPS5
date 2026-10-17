@@ -38,8 +38,14 @@ class SelectTests(unittest.TestCase):
     def setUpClass(cls):
         cls.directory = tempfile.TemporaryDirectory()
         (Path(cls.directory.name) / "real").mkdir()
-        (Path(cls.directory.name) / "link").symlink_to("real", target_is_directory=True)
         root = Path(cls.directory.name) / "link"
+        try:
+            root.symlink_to("real", target_is_directory=True)
+        except OSError as error:
+            if getattr(error, "winerror", None) != 1314:
+                raise
+            import _winapi
+            _winapi.CreateJunction(str(Path(cls.directory.name) / "real"), str(root))
         cls.source, cls.build, cls.graph = root / "source", root / "build", root / "graph.json"
         for name, content in PROJECT.items():
             (cls.source / name).parent.mkdir(parents=True, exist_ok=True)

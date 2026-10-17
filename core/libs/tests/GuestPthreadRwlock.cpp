@@ -3,7 +3,6 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
-#include <stdexcept>
 #include <thread>
 
 extern "C" {
@@ -379,10 +378,8 @@ int main() {
     Require(pthread_rwlock_unlock_nid_postfix(&rwlock) == 0);
     Require(pthread_rwlock_unlock_nid_postfix(&rwlock) == GUEST_EPERM);
 
-    bool rejected = false;
-    try { pthread_rwlock_timedrdlock_nid_postfix(&rwlock, nullptr); }
-    catch (const std::runtime_error&) { rejected = true; }
-    Require(rejected);
+    Require(pthread_rwlock_timedrdlock_nid_postfix(&rwlock, nullptr) == 0);
+    Require(pthread_rwlock_unlock_nid_postfix(&rwlock) == 0);
     Require(pthread_rwlock_destroy_nid_postfix(&rwlock) == 0);
     Require(rwlock == DestroyedRwlock);
 

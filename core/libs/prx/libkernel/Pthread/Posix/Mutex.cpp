@@ -62,7 +62,7 @@ int APS5_VABI pthread_mutex_lock_nid_postfix(PthreadMutex* mutex) {
 }
 
 int APS5_VABI pthread_mutex_timedlock_nid_postfix(PthreadMutex* mutex, const KernelTimespec* abstime) {
-    if (!abstime) throw std::runtime_error("pthread_mutex_timedlock: null abstime");
+    if (!abstime) return pthread_mutex_lock_nid_postfix(mutex);
     _initializeStatic(mutex, __func__);
     if (scePthreadMutexTrylock(mutex) == 0) return 0;
     KernelUseconds usec = 0;

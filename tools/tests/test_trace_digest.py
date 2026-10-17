@@ -97,6 +97,14 @@ class TraceDigestTests(unittest.TestCase):
         self.assertEqual(thread["folded_ms_per_frame"], 1.5)
         self.assertEqual(thread["untraced_ms_per_frame"], 0)
 
+    def test_trace_accepts_event_array_and_empty_document(self):
+        trace_from_array = trace_digest.Trace(EVENTS)
+        self.assertEqual(len(trace_from_array.presents), 3)
+        empty_dict = trace_digest.Trace({})
+        self.assertEqual(empty_dict.presents, [])
+        empty_list = trace_digest.Trace([])
+        self.assertEqual(empty_list.presents, [])
+
     def result(self):
         return trace_digest.digest(trace_digest.load_trace(self.trace), trace_digest.load_summary(None, self.trace),
                                    trace_digest.load_stacks(self.stacks), worst=2, top=3)

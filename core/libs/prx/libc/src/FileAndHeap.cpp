@@ -26,6 +26,7 @@
 #include "prx/libc/include/ApplicationHeap.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/FilesystemError.hpp"
+#include "prx/libc/include/HostErrno.hpp"
 #include "prx/libc/include/AppArchive.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 
@@ -284,7 +285,7 @@ FileStream* APS5_VABI freopen_nid_postfix(const char* filename, const char* mode
             if (!path.empty() && parsed->writes) RecordWrittenPath_nid_no_patch(path);
             return stream;
         }
-        const int error = errno;
+        const int error = GuestErrnoFromHost_nid_no_patch(errno);
         if (stream->IsDynamic()) delete stream;
         errno = error;
         return nullptr;
@@ -303,8 +304,7 @@ FileStream* APS5_VABI fopen_nid_postfix(const char* filename, const char* mode) 
     if (const int error = ResolvePathError_nid_no_patch(filename, fpath)) { errno = error; return nullptr; }
     std::unique_ptr<std::FILE, int (*)(std::FILE*)> handle(OpenNative(fpath, parsed->native), std::fclose);
     if (!handle) {
-        const int error = errno;
-        errno = error;
+        errno = GuestErrnoFromHost_nid_no_patch(errno);
         return nullptr;
     }
     // APS5_LOG_OUT("success: \"%s\"", abs_path.c_str());
@@ -317,12 +317,11 @@ FileStream* APS5_VABI fopen_nid_postfix(const char* filename, const char* mode) 
 
 int APS5_VABI fopen_s_nid_postfix(FileStream** result, const char* filename, const char* mode) {
     constexpr int GuestEinval = 22;
-    constexpr int GuestEnoent = 2;
     if (!result) return GuestEinval;
     *result = nullptr;
     if (!filename || !mode) return GuestEinval;
     *result = fopen_nid_postfix(filename, mode);
-    return *result ? 0 : GuestEnoent;
+    return *result ? 0 : errno;
 }
 
 int APS5_VABI fclose_nid_postfix(FileStream* stream) {
