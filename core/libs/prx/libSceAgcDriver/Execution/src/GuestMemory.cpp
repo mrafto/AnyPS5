@@ -783,6 +783,7 @@ struct WriteTracker {
     // bumps, or an image refreshed after a stamp would keep failing UnchangedSince until the next
     // walk of its range and re-upload at every use of the epoch.
     std::atomic<std::uint32_t> generation{1};
+    std::uint64_t walkedPages = 0;
     std::vector<void*> pages;
     // Collect memo: page-rounded ranges walked during the current epoch (see BumpCollectEpoch). A
     // collect fully inside one skips GetWriteWatch, whose cost is proportional to the range's pages,
@@ -1121,6 +1122,7 @@ void stampWrittenRun(void* context, std::uintptr_t begin, std::uintptr_t end) {
     const auto kind = runs.kind;
     if (end <= begin) return;
     ++runs.stamped;
+    runs.tracker.walkedPages += (end - begin) / WritePageBytes;
     const auto generation = tracker.generation.load(std::memory_order_relaxed);
     if (kind != StampKind::Driver) tracker.noteCpuStore(begin, end, generation);
     if (runs.window != nullptr) {
@@ -1173,6 +1175,33 @@ bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, 
     if (collectDirtyRuns.load(std::memory_order_relaxed) != dirtyRuns) collectDirty.fetch_add(1, std::memory_order_relaxed);
     return complete;
 #endif
+}
+
+struct WalkClasses {
+    static constexpr std::size_t Count = 4;
+    std::array<std::atomic<std::uint64_t>, Count> walks{};
+    std::array<std::atomic<std::uint64_t>, Count> nanoseconds{};
+    std::array<std::atomic<std::uint64_t>, Count> pages{};
+    std::atomic<std::int64_t> lastReport{0};
+};
+
+void noteWalk(std::uint64_t bytes, std::uint64_t nanoseconds, std::uint64_t pages) {
+    static WalkClasses classes;
+    const std::size_t index = bytes < (std::uint64_t{1} << 20u) ? 0 : bytes < (std::uint64_t{1} << 26u) ? 1 : bytes < (std::uint64_t{1} << 30u) ? 2 : 3;
+    classes.walks[index].fetch_add(1, std::memory_order_relaxed);
+    classes.nanoseconds[index].fetch_add(nanoseconds, std::memory_order_relaxed);
+    classes.pages[index].fetch_add(pages, std::memory_order_relaxed);
+    const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = classes.lastReport.load(std::memory_order_relaxed);
+    if (nowMs - last < 10000 || !classes.lastReport.compare_exchange_strong(last, nowMs)) return;
+    static constexpr const char* names[WalkClasses::Count] = {"<1 MiB", "<64 MiB", "<1 GiB", ">=1 GiB"};
+    std::string line;
+    for (std::size_t i = 0; i < WalkClasses::Count; ++i) {
+        char part[128];
+        std::snprintf(part, sizeof(part), " %s %llu walks/%.1f ms/%llu dirty pages;", names[i], static_cast<unsigned long long>(classes.walks[i].exchange(0)), static_cast<double>(classes.nanoseconds[i].exchange(0)) / 1e6, static_cast<unsigned long long>(classes.pages[i].exchange(0)));
+        line += part;
+    }
+    AgcDriver::ProfilePrint_nid_no_patch("[collect-walks] (10 s, real walks by range size):%s\n", line.c_str());
 }
 
 std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoized) {
@@ -1230,7 +1259,11 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
         }
     }
 #endif
+    const bool walkProfiled = MemoryProfiled();
+    const auto walkStarted = walkProfiled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const auto stampsBefore = walkProfiled ? tracker.walkedPages : 0;
     if (!walkWrites(tracker, first, stop, StampKind::Cpu)) return 0;
+    if (walkProfiled) noteWalk(stop - first, static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - walkStarted).count()), tracker.walkedPages - stampsBefore);
     // Only a completed walk is remembered; a failed one (uncommitted pages) returned 0 above.
     if (collectMemoEnabled()) {
         const auto serial = unwatchSerial.load(std::memory_order_relaxed);

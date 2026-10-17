@@ -1373,6 +1373,12 @@ struct AddressBuildTiming {
     double importsUs = 0;
     double mirrorsUs = 0;
     double compareUs = 0;
+    double writableUs = 0;
+    double heapPrepareUs = 0;
+    double heapCollectUs = 0;
+    double heapUnchangedUs = 0;
+    double heapChangedUs = 0;
+    std::uint64_t heapRuns = 0;
     std::uint64_t blocksCompared = 0;
     std::uint64_t blocksCopied = 0;
 };
@@ -1869,16 +1875,31 @@ void planSpaceMirrors(GuestBufferMemory::AddressSpace& space) {
 }
 
 std::vector<std::pair<std::size_t, std::uint64_t>> refreshHeapRuns(const GuestBufferMemory::AddressSpace& space, std::vector<RefreshBlock>& blocks) {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    auto& timing = ThreadAddressTiming();
+    auto at = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const auto lap = [&](double& into) {
+        if (!profile) return;
+        const auto now = std::chrono::steady_clock::now();
+        into += std::chrono::duration<double, std::micro>(now - at).count();
+        at = now;
+    };
     std::vector<std::pair<std::size_t, std::uint64_t>> checked;
     checked.reserve(space.heapRuns.size());
     for (std::size_t index = 0; index < space.heapRuns.size(); ++index) {
         const auto& run = space.heapRuns[index];
+        ++timing.heapRuns;
         prepareRange(run.begin, run.bytes);
+        lap(timing.heapPrepareUs);
         const auto generation = GuestMemory::CollectWrites(run.begin, static_cast<std::size_t>(run.bytes));
+        lap(timing.heapCollectUs);
         const auto group = std::span<ImageMirror* const>(space.heapMirrors).subspan(run.first, run.last - run.first);
         const auto since = space.verified[index].load(std::memory_order_relaxed);
+        const bool changed = generation != 0 && (since == 0 || !GuestMemory::UnchangedSince(run.begin, static_cast<std::size_t>(run.bytes), since));
+        lap(timing.heapUnchangedUs);
         if (generation == 0) appendAllBlocks(group, blocks);
-        else if (since == 0 || !GuestMemory::UnchangedSince(run.begin, static_cast<std::size_t>(run.bytes), since)) appendChangedBlocks(group, generation, blocks);
+        else if (changed) appendChangedBlocks(group, generation, blocks);
+        lap(timing.heapChangedUs);
         checked.emplace_back(index, generation);
     }
     return checked;
@@ -2808,6 +2829,12 @@ void GuestBufferMemory::CountAddressBuild(double snapshotsUs) {
     totals.sums.importsUs += timing.importsUs;
     totals.sums.mirrorsUs += timing.mirrorsUs;
     totals.sums.compareUs += timing.compareUs;
+    totals.sums.writableUs += timing.writableUs;
+    totals.sums.heapPrepareUs += timing.heapPrepareUs;
+    totals.sums.heapCollectUs += timing.heapCollectUs;
+    totals.sums.heapUnchangedUs += timing.heapUnchangedUs;
+    totals.sums.heapChangedUs += timing.heapChangedUs;
+    totals.sums.heapRuns += timing.heapRuns;
     totals.sums.blocksCompared += timing.blocksCompared;
     totals.sums.blocksCopied += timing.blocksCopied;
     totals.snapshotsUs += snapshotsUs;
@@ -2822,6 +2849,7 @@ void GuestBufferMemory::CountAddressBuild(double snapshotsUs) {
     const auto space = AddressSpaceCounters();
     const auto& spaceSeen = totals.spaceSeen;
     AgcDriver::ProfilePrint_nid_no_patch("[address] %llu address-based builds (10 s), us per build: lease %.0f, imports pass %.0f, mirror prepare %.0f, compare %.0f (%.0f blocks, %.1f copied), snapshots %.0f; space hits %llu / rebuilds: generation %llu, epoch %llu, device %llu, waiter drop %llu, first %llu; unpublished %llu, dissolved: overlap %llu, imports %llu%s; [bda-table] hits %llu / misses %llu (space tables %llu), first entry: expired %llu, hash differs low %llu / heap %llu, same hash %llu, none held %llu\n", static_cast<unsigned long long>(totals.builds), per(totals.sums.leaseUs), per(totals.sums.importsUs), per(totals.sums.mirrorsUs), per(totals.sums.compareUs), per(static_cast<double>(totals.sums.blocksCompared)), per(static_cast<double>(totals.sums.blocksCopied)), per(totals.snapshotsUs), delta(space.hits, spaceSeen.hits), delta(space.rebuiltGeneration, spaceSeen.rebuiltGeneration), delta(space.rebuiltEpoch, spaceSeen.rebuiltEpoch), delta(space.rebuiltDevice, spaceSeen.rebuiltDevice), delta(space.rebuiltWaiterDrop, spaceSeen.rebuiltWaiterDrop), delta(space.rebuiltFirst, spaceSeen.rebuiltFirst), delta(space.unpublished, spaceSeen.unpublished), delta(space.dissolvedOverlap, spaceSeen.dissolvedOverlap), delta(space.dissolvedImports, spaceSeen.dissolvedImports), space.enabled ? "" : " (cache off)", delta(table.hits, seen.hits), delta(table.misses, seen.misses), delta(table.spaceTables, seen.spaceTables), delta(table.firstExpired, seen.firstExpired), delta(table.firstDiffersLow, seen.firstDiffersLow), delta(table.firstDiffersHeap, seen.firstDiffersHeap), delta(table.firstSameHash, seen.firstSameHash), delta(table.firstEmpty, seen.firstEmpty));
+    AgcDriver::ProfilePrint_nid_no_patch("[address-heap] us per build: writable mirror prepare %.0f, heap prepare %.0f, heap collect %.0f, heap unchanged check %.0f, heap changed blocks %.0f; %.2f heap runs per build\n", per(totals.sums.writableUs), per(totals.sums.heapPrepareUs), per(totals.sums.heapCollectUs), per(totals.sums.heapUnchangedUs), per(totals.sums.heapChangedUs), per(static_cast<double>(totals.sums.heapRuns)));
     totals.tableSeen = table;
     totals.spaceSeen = space;
     totals.builds = 0;
@@ -2897,6 +2925,7 @@ void GuestBufferMemory::AcquireRegistered() {
                 const auto& region = space->base[index];
                 if (prepareRefresh(*region.mirror, region.begin, region.end - region.begin)) appendBlocks(blocks, *region.mirror, region.begin, region.end - region.begin);
             }
+            if (profile) timing.writableUs += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - at).count();
             lap(timing.mirrorsUs, at);
         }
     }
