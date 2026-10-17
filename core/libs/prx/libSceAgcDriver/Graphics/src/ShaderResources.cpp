@@ -2816,10 +2816,49 @@ bool CompletePendingCpuWrites(const Context& context, std::uint64_t address, std
         return std::any_of(writers.begin(), writers.end(), [&](const auto& writer) { return writer->WritesOverlap(address, bytes); });
     };
     static const bool readersWait = std::getenv("APS5_READERS_WAIT_COMPLETION_LABELS") != nullptr;
-    const bool labelWait = labels && (!readOnly || readersWait) && recorder->PendingLabelIn(address, bytes);
-    if ((context.copiedWriters != nullptr && overlaps(*context.copiedWriters)) || overlaps(*drawWriters) || labelWait) {
+    // A label stored on the GPU (not deferred behind a completion) is ordered ahead of in-place GPU work on
+    // its queue, writers included; only a label whose store waits for the completion can race one.
+    static const bool writersWaitAll = std::getenv("APS5_WRITERS_WAIT_ALL_LABELS") != nullptr;
+    const bool labelWait = labels && (readOnly ? readersWait && recorder->PendingLabelIn(address, bytes) : (writersWaitAll ? recorder->PendingLabelIn(address, bytes) : recorder->CompletionLabelIn(address, bytes)));
+    const bool copiedOverlap = context.copiedWriters != nullptr && overlaps(*context.copiedWriters);
+    const bool drawOverlap = !copiedOverlap && overlaps(*drawWriters);
+    if (copiedOverlap || drawOverlap || labelWait) {
         Recorder::CountSync(4);
+        static const bool profiled = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+        if (!profiled) {
+            recorder->SyncThrough(address, bytes);
+            return true;
+        }
+        // Per trigger (copied writer, draw writer, label): syncs, wall time, bytes covered, and how many were read-only.
+        struct Reason {
+            std::atomic<std::uint64_t> syncs{0}, micros{0}, bytes{0}, readOnly{0};
+        };
+        static Reason reasons[3];
+        static std::atomic<std::int64_t> lastReport{0};
+        static std::atomic<int> sampled{0};
+        if (labelWait && !copiedOverlap && !drawOverlap && sampled.load(std::memory_order_relaxed) < 400 && sampled.fetch_add(1, std::memory_order_relaxed) % 8 == 0) {
+            AgcDriver::ProfilePrint_nid_no_patch("[cpu-write-sync] sample label wait %llx+%llx caller %p\n", static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes), __builtin_return_address(0));
+        }
+        const auto begin = std::chrono::steady_clock::now();
         recorder->SyncThrough(address, bytes);
+        const auto end = std::chrono::steady_clock::now();
+        auto& reason = reasons[copiedOverlap ? 0 : drawOverlap ? 1 : 2];
+        reason.syncs.fetch_add(1, std::memory_order_relaxed);
+        reason.micros.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(end - begin).count()), std::memory_order_relaxed);
+        reason.bytes.fetch_add(bytes, std::memory_order_relaxed);
+        if (readOnly) reason.readOnly.fetch_add(1, std::memory_order_relaxed);
+        const auto nowTick = std::chrono::duration_cast<std::chrono::seconds>(end.time_since_epoch()).count();
+        auto last = lastReport.load(std::memory_order_relaxed);
+        if (nowTick - last >= 10 && lastReport.compare_exchange_strong(last, nowTick)) {
+            static const char* names[3] = {"copied writer", "draw writer", "label"};
+            std::string line;
+            for (int index = 0; index < 3; ++index) {
+                char part[160];
+                std::snprintf(part, sizeof(part), " %s %llu syncs/%.0f ms/%llu KiB/%llu read-only;", names[index], static_cast<unsigned long long>(reasons[index].syncs.exchange(0)), static_cast<double>(reasons[index].micros.exchange(0)) / 1000.0, static_cast<unsigned long long>(reasons[index].bytes.exchange(0) >> 10u), static_cast<unsigned long long>(reasons[index].readOnly.exchange(0)));
+                line += part;
+            }
+            AgcDriver::ProfilePrint_nid_no_patch("[cpu-write-sync] (10 s, by trigger):%s\n", line.c_str());
+        }
         return true;
     }
     return false;
