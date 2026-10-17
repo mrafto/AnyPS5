@@ -1053,7 +1053,7 @@ int APS5_VABI getdents_nid_postfix(int fd, char* buf, int nbytes) {
 
 int APS5_VABI sceKernelMkdir(const char* path, uint16_t mode) {
     (void)mode;
-    if (path == nullptr) throw std::invalid_argument("sceKernelMkdir: path is null");
+    if (!path) return SceErrorFromErrno(GUEST_EFAULT);
     if (!*path) return SceErrorFromErrno(GUEST_ENOENT);
     std::filesystem::path native;
     if (const int error = ResolvePathError_nid_no_patch(path, native)) return SceKernelError(error);
@@ -1270,7 +1270,7 @@ int64_t APS5_VABI pwritev_nid_postfix(int d, const KernelIovec* iov, int iovcnt,
 }
 
 int APS5_VABI sceKernelRename(const char* from, const char* to) {
-    if (from == nullptr || to == nullptr) throw std::invalid_argument("sceKernelRename: path is null");
+    if (!from || !to) return SceErrorFromErrno(GUEST_EFAULT);
     if (*from == '\0' || *to == '\0') return SceErrorFromErrno(GUEST_ENOENT);
     std::filesystem::path source;
     if (const int error = ResolvePathError_nid_no_patch(from, source)) return SceKernelError(error);
@@ -1292,7 +1292,7 @@ int APS5_VABI sceKernelRename(const char* from, const char* to) {
 }
 
 int APS5_VABI sceKernelRmdir(const char* path) {
-    if (path == nullptr) throw std::invalid_argument("sceKernelRmdir: path is null");
+    if (!path) return SceErrorFromErrno(GUEST_EFAULT);
     if (*path == '\0') return SceErrorFromErrno(GUEST_ENOENT);
     std::filesystem::path native;
     if (const int error = ResolvePathError_nid_no_patch(path, native)) return SceKernelError(error);
@@ -1339,7 +1339,7 @@ int APS5_VABI fchmod_nid_postfix(int d, int mode) {
 }
 
 int APS5_VABI sceKernelTruncate_nid_postfix(const char* path, std::int64_t length) {
-    if (path == nullptr) throw std::invalid_argument("sceKernelTruncate: path is null");
+    if (!path) return SceErrorFromErrno(GUEST_EFAULT);
     if (*path == '\0') return SceErrorFromErrno(GUEST_ENOENT);
     if (length < 0) return SceErrorFromErrno(GUEST_EINVAL);
     std::filesystem::path native;
@@ -1359,7 +1359,7 @@ int APS5_VABI truncate_nid_postfix(const char* path, std::int64_t length) {
 }
 
 int APS5_VABI sceKernelUtimes_nid_postfix(const char* path, const KernelTimeval* times) {
-    if (path == nullptr) throw std::invalid_argument("sceKernelUtimes: path is null");
+    if (!path) return SceErrorFromErrno(GUEST_EFAULT);
     if (*path == '\0') return SceErrorFromErrno(GUEST_ENOENT);
     if (times != nullptr) {
         for (int i = 0; i < 2; ++i) {
