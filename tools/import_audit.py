@@ -182,7 +182,7 @@ def elf_exports(path, data):
             binding, visibility = info >> 4, other & 3
             if name == 0 or index == 0 or binding not in (1, 2, 10) or visibility not in (0, 3):
                 continue
-            names.add(cstring(data, strings_offset + name, strings_offset + strings_size, path, "export name"))
+            names.add(cstring(data, strings_offset + name, strings_offset + strings_size, path, "export name").split(MODULE_SUFFIX, 1)[0])
     return names
 
 
@@ -411,7 +411,10 @@ def read_registry(path):
         nid = entry["nid"].split("#", 1)[0]
         if not NID.fullmatch(nid):
             raise AuditError(f"{path}: entry {index} has an invalid NID {entry['nid']!r}")
-        imports.append((nid, entry["library"], bool(entry.get("weak", False))))
+        weak = entry.get("weak", False)
+        if not isinstance(weak, bool):
+            raise AuditError(f"{path}: entry {index} needs a boolean 'weak' field")
+        imports.append((nid, entry["library"], weak))
     return imports
 
 
@@ -451,7 +454,7 @@ def audit(imports, exports, stubs, libraries, modules, module_imports=None, modu
     for nid, library, weak in imports:
         record = records.setdefault((nid, library), {"nid": nid, "library": library, "references": 0, "weak": weak})
         record["references"] += 1
-        record["weak"] = weak
+        record["weak"] = record["weak"] and weak
     for module, (symbols, needed) in (module_imports or {}).items():
         for nid in symbols:
             record = records.setdefault((nid, None, module), {"nid": nid, "library": None, "module": module, "references": 0, "weak": False})

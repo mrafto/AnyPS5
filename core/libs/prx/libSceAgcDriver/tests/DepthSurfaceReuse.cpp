@@ -10,12 +10,14 @@
 #include <string>
 #include <string_view>
 #include <tuple>
+#include <utility>
 #include <vector>
 
 namespace {
 
 using namespace AgcDriver::Graphics;
 
+constexpr std::uint32_t FormatR8Unorm = 1;
 constexpr std::uint32_t FormatR8Uint = 5;
 constexpr std::uint32_t FormatR16Unorm = 7;
 constexpr std::uint32_t FormatR16Uint = 11;
@@ -43,6 +45,8 @@ VkImage lastImage = VK_NULL_HANDLE;
 std::vector<VkImage> clearedImages;
 VkImageUsageFlags lastImageUsage = 0;
 std::uint32_t imagesDestroyed = 0;
+std::vector<std::pair<VkImage, VkImageAspectFlags>> imageReads;
+std::vector<std::pair<VkImage, VkImageAspectFlags>> imageWrites;
 
 VKAPI_ATTR VkResult VKAPI_CALL createImage(VkDevice, const VkImageCreateInfo* info, const VkAllocationCallbacks*, VkImage* image) {
     lastImageFormat = info->format;
@@ -114,6 +118,33 @@ VKAPI_ATTR void VKAPI_CALL cmdCopyImage(VkCommandBuffer, VkImage source, VkImage
     for (std::uint32_t i = 0; i < count; ++i) imageCopies.emplace_back(source, destination, regions[i].dstSubresource.aspectMask);
 }
 
+VKAPI_ATTR void VKAPI_CALL cmdCopyImageToBuffer(VkCommandBuffer, VkImage source, VkImageLayout, VkBuffer, std::uint32_t count, const VkBufferImageCopy* regions) {
+    for (std::uint32_t i = 0; i < count; ++i) imageReads.emplace_back(source, regions[i].imageSubresource.aspectMask);
+}
+
+VKAPI_ATTR void VKAPI_CALL cmdCopyBufferToImage(VkCommandBuffer, VkBuffer, VkImage destination, VkImageLayout, std::uint32_t count, const VkBufferImageCopy* regions) {
+    for (std::uint32_t i = 0; i < count; ++i) imageWrites.emplace_back(destination, regions[i].imageSubresource.aspectMask);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL createBuffer(VkDevice, const VkBufferCreateInfo*, const VkAllocationCallbacks*, VkBuffer* buffer) {
+    *buffer = newHandle<VkBuffer>();
+    return VK_SUCCESS;
+}
+
+VKAPI_ATTR void VKAPI_CALL bufferMemoryRequirements(VkDevice, VkBuffer, VkMemoryRequirements* requirements) {
+    *requirements = {65536, 256, 1};
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL bindBufferMemory(VkDevice, VkBuffer, VkDeviceMemory, VkDeviceSize) {
+    return VK_SUCCESS;
+}
+
+VKAPI_ATTR void VKAPI_CALL destroyBuffer(VkDevice, VkBuffer, const VkAllocationCallbacks*) {}
+VKAPI_ATTR VkResult VKAPI_CALL mapMemory(VkDevice, VkDeviceMemory, VkDeviceSize, VkDeviceSize, VkMemoryMapFlags, void**) {
+    return VK_ERROR_MEMORY_MAP_FAILED;
+}
+VKAPI_ATTR void VKAPI_CALL unmapMemory(VkDevice, VkDeviceMemory) {}
+
 VKAPI_ATTR void VKAPI_CALL formatProperties(VkPhysicalDevice, VkFormat, VkFormatProperties* properties) {
     *properties = {};
     properties->optimalTilingFeatures = VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
@@ -163,7 +194,15 @@ PFN_vkVoidFunction VKAPI_CALL deviceProc(VkDevice, const char* name) {
         {"vkFreeMemory", reinterpret_cast<PFN_vkVoidFunction>(freeMemory)},
         {"vkCmdPipelineBarrier", reinterpret_cast<PFN_vkVoidFunction>(cmdPipelineBarrier)},
         {"vkCmdClearDepthStencilImage", reinterpret_cast<PFN_vkVoidFunction>(cmdClearDepthStencilImage)},
-        {"vkCmdCopyImage", reinterpret_cast<PFN_vkVoidFunction>(cmdCopyImage)}
+        {"vkCmdCopyImage", reinterpret_cast<PFN_vkVoidFunction>(cmdCopyImage)},
+        {"vkCmdCopyImageToBuffer", reinterpret_cast<PFN_vkVoidFunction>(cmdCopyImageToBuffer)},
+        {"vkCmdCopyBufferToImage", reinterpret_cast<PFN_vkVoidFunction>(cmdCopyBufferToImage)},
+        {"vkCreateBuffer", reinterpret_cast<PFN_vkVoidFunction>(createBuffer)},
+        {"vkGetBufferMemoryRequirements", reinterpret_cast<PFN_vkVoidFunction>(bufferMemoryRequirements)},
+        {"vkBindBufferMemory", reinterpret_cast<PFN_vkVoidFunction>(bindBufferMemory)},
+        {"vkDestroyBuffer", reinterpret_cast<PFN_vkVoidFunction>(destroyBuffer)},
+        {"vkMapMemory", reinterpret_cast<PFN_vkVoidFunction>(mapMemory)},
+        {"vkUnmapMemory", reinterpret_cast<PFN_vkVoidFunction>(unmapMemory)}
     };
     const auto it = table.find(name);
     return it == table.end() ? nullptr : it->second;
@@ -177,6 +216,9 @@ struct View {
     std::uint32_t tileMode = TileDepth64KB;
     std::uint32_t type = Type2D;
     std::uint32_t lastArray = 0;
+    std::uint32_t baseLevel = 0;
+    std::uint32_t lastLevel = 0;
+    std::uint32_t maxMip = 0;
 };
 
 std::array<std::uint32_t, 8> tsharp(const View& view) {
@@ -187,14 +229,46 @@ std::array<std::uint32_t, 8> tsharp(const View& view) {
     words[0] = static_cast<std::uint32_t>(base);
     words[1] = static_cast<std::uint32_t>((base >> 32u) & 0xffu) | ((view.format & 0x1ffu) << 20u) | ((widthMinus1 & 0x3u) << 30u);
     words[2] = ((widthMinus1 >> 2u) & 0xfffu) | ((heightMinus1 & 0x3fffu) << 14u);
-    words[3] = 4u | (5u << 3u) | (6u << 6u) | (7u << 9u) | ((view.tileMode & 0x1fu) << 20u) | ((view.type & 0xfu) << 28u);
+    words[3] = 4u | (5u << 3u) | (6u << 6u) | (7u << 9u) | ((view.baseLevel & 0xfu) << 12u) | ((view.lastLevel & 0xfu) << 16u) | ((view.tileMode & 0x1fu) << 20u) | ((view.type & 0xfu) << 28u);
     words[4] = view.lastArray & 0x1fffu;
+    words[5] = (view.maxMip & 0xfu) << 4u;
     return words;
 }
 
 std::shared_ptr<Texture> lookup(const Context& context, const View& view) {
     const auto words = tsharp(view);
     return DepthSurfaceTexture(context, words, DecodeTextureResource(words), VkComponentMapping{});
+}
+
+void TestStencilUnormView(const Context& context) {
+    constexpr std::uint64_t depth = 0x74000000;
+    constexpr std::uint64_t stencil = 0x74800000;
+    constexpr std::uint64_t other = 0x75000000;
+    const auto before = createdImages.size();
+    DepthSurfaceView(context, {depth, stencil, {320, 180}, VK_FORMAT_D32_SFLOAT_S8_UINT, 1.0f, 0});
+    Require(createdImages.size() == before + 1, "binding a new depth surface must create one image");
+    const auto surface = createdImages[before];
+    DepthSurfaceView(context, {other, 0, {64, 64}, VK_FORMAT_D32_SFLOAT, 1.0f, 0});
+    imageReads.clear();
+    imageWrites.clear();
+    Require(lookup(context, {stencil, FormatR8Uint, 320, 180}) != nullptr && imageReads.empty() && imageWrites.empty(), "an R8_UINT view of a stencil plane must sample it without a copy");
+    const auto first = lookup(context, {stencil, FormatR8Unorm, 320, 180});
+    Require(first != nullptr && lastImageFormat == VK_FORMAT_R8_UNORM, "an R8_UNORM view of a stencil plane must sample an R8_UNORM copy of it");
+    const auto copy = createdImages.back();
+    const std::vector<std::pair<VkImage, VkImageAspectFlags>> read{{surface, VK_IMAGE_ASPECT_STENCIL_BIT}};
+    const std::vector<std::pair<VkImage, VkImageAspectFlags>> written{{copy, VK_IMAGE_ASPECT_COLOR_BIT}};
+    Require(imageReads == read && imageWrites == written, "the R8_UNORM copy must be filled from the stencil aspect of the depth image");
+    Require(lookup(context, {stencil, FormatR8Unorm, 320, 180}) == first && imageReads.size() == 1, "sampling the stencil plane again with no write in between must reuse the copy");
+    DepthSurfaceView(context, {depth, stencil, {320, 180}, VK_FORMAT_D32_SFLOAT_S8_UINT, 1.0f, 0});
+    lookup(context, {stencil, FormatR8Unorm, 320, 180});
+    lookup(context, {stencil, FormatR8Unorm, 320, 180});
+    Require(imageReads.size() == 3 && imageWrites.size() == 3, "sampling the stencil plane of the bound depth surface must copy it each time");
+    DepthSurfaceView(context, {other, 0, {64, 64}, VK_FORMAT_D32_SFLOAT, 1.0f, 0});
+    lookup(context, {stencil, FormatR8Unorm, 320, 180});
+    lookup(context, {stencil, FormatR8Unorm, 320, 180});
+    Require(imageReads.size() == 4 && imageWrites.size() == 4, "after the surface is unbound, its stencil copy must be refreshed once");
+    Require(createdImages.back() == copy, "refreshing the stencil copy must reuse its image");
+    ClearDepthSurfaces(context.device);
 }
 
 void TestD16StencilFallback(const Context& context) {
@@ -314,6 +388,7 @@ void RunDepthSurfaceReuseTests() {
     TestD16StencilFallback(context);
     TestMultisampleDepthOwnership(context);
     TestMultisampleStencilAliases(context);
+    TestStencilUnormView(context);
     constexpr std::uint64_t depth32 = 0x40000000;
     constexpr std::uint64_t depth16 = 0x50000000;
     constexpr std::uint64_t depthStencil = 0x60000000;
@@ -332,6 +407,8 @@ void RunDepthSurfaceReuseTests() {
     Require(lookup(context, {depth32, FormatR32Float, 512, 512, TileDepth64KB, Type2DArray, 5}) == nullptr, "a 2D array view of another extent over a depth surface must be read as reused memory");
     Require(lookup(context, {depth32, FormatR32Uint, 384, 384, TileRenderTarget64KB}) == nullptr, "an R32 uint view without a depth layout must be read as reused memory");
     Require(lookup(context, {depth16, FormatR32Float, 256, 256}) == nullptr, "an R32F view of a D16 surface's own extent must be read as reused memory");
+    Require(lookup(context, {depth32, FormatR32Float, 384, 384, TileDepth64KB, Type2D, 0, 0, 0, 4}) != nullptr, "the first level of a mipmapped R32F view of a D32 surface's own extent must sample its depth plane");
+    Require(lookup(context, {depth32, FormatR32Float, 384, 384, TileDepth64KB, Type2D, 0, 1, 1, 4}) == nullptr, "a view that starts past the first level of a D32 surface's own extent must be read as reused memory");
 
     Require(lookup(context, {stencil, FormatR8Uint, 320, 180}) != nullptr, "an 8-bit view of a stencil plane's own extent must sample the stencil plane");
     Require(lookup(context, {stencil, FormatR8G8B8A8Unorm, 320, 180, TileRenderTarget64KB}) == nullptr, "an RGBA8 view of a stencil plane's own extent must be read as reused memory");

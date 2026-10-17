@@ -30,6 +30,8 @@ std::int64_t APS5_VABI write_nid_postfix(int, const char*, std::int64_t);
 std::int64_t APS5_VABI _read_nid_postfix(int, void*, std::size_t);
 std::int64_t APS5_VABI _write_nid_postfix(int, const void*, std::size_t);
 std::int64_t APS5_VABI lseek_nid_postfix(int, std::int64_t, int);
+std::int64_t APS5_VABI pread_nid_postfix(int, void*, std::size_t, std::int64_t);
+std::int64_t APS5_VABI pwrite_nid_disambig1_nid_postfix(int, const void*, std::size_t, std::int64_t);
 std::int64_t APS5_VABI sceKernelRead(int, void*, std::size_t);
 std::int64_t APS5_VABI sceKernelWrite(int, const void*, std::size_t);
 std::int64_t APS5_VABI sceKernelLseek(int, std::int64_t, int);
@@ -121,6 +123,16 @@ int main() {
     RequirePosixFailure([&] { return _read_nid_postfix(-1, nullptr, 0); }, EBADF);
     RequirePosixFailure([&] { return write_nid_postfix(-1, nullptr, 0); }, EBADF);
     RequirePosixFailure([&] { return _write_nid_postfix(-1, nullptr, 0); }, EBADF);
+    constexpr auto oversized = static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max()) + 1;
+    RequirePosixFailure([&] { return read_nid_postfix(descriptor, buffer, oversized); }, EINVAL);
+    RequirePosixFailure([&] { return _read_nid_postfix(descriptor, buffer, oversized); }, EINVAL);
+    RequirePosixFailure([&] { return write_nid_postfix(descriptor, payload, -1); }, EINVAL);
+    RequirePosixFailure([&] { return write_nid_postfix(descriptor, payload, std::numeric_limits<std::int64_t>::min()); }, EINVAL);
+    RequirePosixFailure([&] { return _write_nid_postfix(descriptor, payload, oversized); }, EINVAL);
+    RequirePosixFailure([&] { return pread_nid_postfix(descriptor, buffer, oversized, 0); }, EINVAL);
+    RequirePosixFailure([&] { return pwrite_nid_disambig1_nid_postfix(descriptor, payload, oversized, 0); }, EINVAL);
+    RequirePosixFailure([&] { return read_nid_postfix(-1, buffer, oversized); }, EINVAL);
+    RequirePosixFailure([&] { return write_nid_postfix(-1, payload, -1); }, EINVAL);
 #ifdef _WIN32
     errno = EACCES;
     bool limitDiagnosticPreserved = false;
@@ -135,6 +147,12 @@ int main() {
     Require(sceKernelRead(-1, direct, 1) == static_cast<std::int32_t>(0x80020009u));
     Require(sceKernelWrite(-1, direct, 1) == static_cast<std::int32_t>(0x80020009u));
     Require(sceKernelLseek(-1, 0, 0) == static_cast<std::int32_t>(0x80020009u));
+    Require(sceKernelRead(descriptor, nullptr, 1) == static_cast<std::int32_t>(0x8002000eu));
+    Require(sceKernelWrite(descriptor, nullptr, 1) == static_cast<std::int32_t>(0x8002000eu));
+    Require(sceKernelRead(descriptor, nullptr, 0) == 0);
+    Require(sceKernelWrite(descriptor, nullptr, 0) == 0);
+    Require(sceKernelRead(-1, nullptr, 0) == static_cast<std::int32_t>(0x80020009u));
+    Require(sceKernelWrite(-1, nullptr, 0) == static_cast<std::int32_t>(0x80020009u));
     Require(close_nid_postfix(descriptor) == 0);
     const int readOnly = open_nid_postfix(fileName.c_str(), SCE_KERNEL_O_RDONLY, 0);
     Require(readOnly >= 0);
