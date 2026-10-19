@@ -60,16 +60,15 @@ static int NativeRead(int fd, void* buf, std::size_t n) {
     if (n > static_cast<std::size_t>(std::numeric_limits<unsigned int>::max())) {
         throw std::runtime_error("sceKernelRead: nbytes exceeds platform limit");
     }
+    if (File::IsDirectoryDescriptor(fd)) {
+        errno = EISDIR;
+        return -1;
+    }
     const auto positioned = File::LockPositionedTransfer(fd);
-    // A descriptor that another thread closed meanwhile is a bad descriptor (EBADF), not a fatal error.
     const auto previous = _set_thread_local_invalid_parameter_handler(IgnoreInvalidParameter);
     const int result = ::_read(fd, buf, static_cast<unsigned int>(n));
     _set_thread_local_invalid_parameter_handler(previous);
     if (result < 0 && _doserrno == ERROR_NO_DATA) errno = EAGAIN;
-    if (result == 0 && File::DirectoryDescriptorPath(fd)) {
-        errno = EISDIR;
-        return -1;
-    }
     return result;
 }
 static int NativeWrite(int fd, const void* buf, std::size_t n) {
@@ -103,6 +102,17 @@ static int NativeUnlink(const std::filesystem::path& p) {
     if (unlocked) ::_wchmod(path.c_str(), _S_IREAD);
     errno = error;
     return -1;
+}
+static std::filesystem::path NativeMetadataPath(const std::filesystem::path& path, std::error_code& error) {
+    const auto& input = path.native();
+    if (input.starts_with(L"\\\\?\\") || input.starts_with(L"\\\\.\\")) return path;
+    auto absolute = std::filesystem::absolute(path, error);
+    if (error) return {};
+    absolute = absolute.lexically_normal().make_preferred();
+    const auto& native = absolute.native();
+    if (native.size() < MAX_PATH || native.starts_with(L"\\\\?\\") || native.starts_with(L"\\\\.\\")) return absolute;
+    return native.starts_with(L"\\\\") ? std::filesystem::path(L"\\\\?\\UNC\\" + native.substr(2))
+                                            : std::filesystem::path(L"\\\\?\\" + native);
 }
 static int MapFlags(int sceFlags) {
     int f = 0;
@@ -161,8 +171,7 @@ extern "C" int APS5_VABI fcntl_nid_postfix(int descriptor, int command, ...);
 static constexpr int GuestSetFlags = 4;
 
 static int SceErrorFromErrno(int error) {
-    constexpr int GuestEio = 5;
-    const int guest = error > 0 && error <= 34 ? error : GuestEio;
+    const int guest = error > 0 && error <= 34 ? error : FilesystemError(std::error_code(error, std::generic_category()));
     return static_cast<int>(0x80020000u | static_cast<unsigned>(guest));
 }
 
@@ -236,8 +245,17 @@ int APS5_VABI sceKernelOpen(const char* path, int flags, std::uint16_t mode) {
     }
     std::filesystem::path native;
     const bool module = (flags & (SCE_KERNEL_O_ACCMODE | SCE_KERNEL_O_CREAT)) == SCE_KERNEL_O_RDONLY;
-    if (const int error = ResolvePathError_nid_no_patch(path, native, module, true)) return SceKernelError(error);
-    return OpenNative(native, flags, mode);
+    if (const int error = ResolvePathError_nid_no_patch(path, native, module, true)) {
+        const int result = SceKernelError(error);
+        APS5_LOG_ERR("open failed path=%s resolveError=%d result=0x%08X", path != nullptr ? path : "<null>", error, static_cast<unsigned>(result));
+        return result;
+    }
+    const int result = OpenNative(native, flags, mode);
+    if (result < 0) {
+        const auto resolved = native.u8string();
+        APS5_LOG_ERR("open failed path=%s resolvedPath=%s result=0x%08X", path != nullptr ? path : "<null>", reinterpret_cast<const char*>(resolved.c_str()), static_cast<unsigned>(result));
+    }
+    return result;
 }
 
 int OpenInDirectory_nid_no_patch(int directory, const char* path, int flags, std::uint16_t mode) {
@@ -297,6 +315,7 @@ std::int64_t APS5_VABI sceKernelWrite(int d, const void* buf, std::size_t nbytes
         const char empty = 0;
         return sceKernelWrite(d, &empty, 0);
     }
+    GuestArena::GuestArenaPrepareHostRead_nid_no_patch(buf, nbytes);
     auto n = NativeWrite(d, buf, nbytes);
     if (n < 0) return SceIoErrorFromErrno(errno);
     return static_cast<std::int64_t>(n);
@@ -335,15 +354,21 @@ int APS5_VABI sceKernelStat(const char* path, FileStat* sb) {
         *sb = archived;
         return 0;
     }
-    const auto status = std::filesystem::status(native, error);
+    auto metadataPath = native;
+#ifdef _WIN32
+    metadataPath = NativeMetadataPath(native, error);
+    if (error) return SceErrorFromErrno(FilesystemError(error));
+#endif
+    const auto status = std::filesystem::status(metadataPath, error);
     if (error == std::errc::not_a_directory) return SceErrorFromErrno(GuestEnotdir);
+    if (error == std::errc::filename_too_long || error == std::errc::too_many_symbolic_link_levels) return SceKernelError(FilesystemError(error));
     if (!std::filesystem::exists(status)) {
         return SceErrorFromErrno(2);
     }
     const std::string_view guestPath(path);
     if (!guestPath.empty() && guestPath.back() == '/' && !std::filesystem::is_directory(status)) return SceErrorFromErrno(GuestEnotdir);
     if (sb == nullptr) return SceErrorFromErrno(GuestEfault);
-    File::FillFileStat(native, sb);
+    File::FillFileStat(metadataPath, sb);
     return 0;
 }
 

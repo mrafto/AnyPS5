@@ -5,6 +5,7 @@ import gzip
 import html
 import json
 import sys
+import zlib
 from pathlib import Path
 
 DESCRIPTION = """Digest of an APS5_TRACE_FRAMES / APS5_TRACE_SECONDS capture (aps5-trace-*.json.gz) for an issue or a
@@ -22,7 +23,7 @@ RAMP = "._:-=+*#%@"
 
 
 def is_wait(name):
-    return name.startswith("GpuMutex.wait.") or "wait" in name.rsplit(".", 1)[-1].lower()
+    return "wait" in name.lower()
 
 
 class Trace:
@@ -129,13 +130,19 @@ def digest(trace, summary=None, stacks=None, worst=5, top=10):
     waits = []
     for tid in sorted(trace.slices.keys() | trace.folded.keys()):
         slices = trace.slices.get(tid, [])
-        traced = sum(dur for _, dur, _, depth, _ in slices if depth == 0)
-        waited = sum(dur for _, dur, name, _, nested in slices if is_wait(name) and not nested)
+        traced = 0.0
+        waited = 0.0
         leaders = collections.Counter()
         for ts, dur, name, depth, nested in slices:
-            totals[name] += dur
-            if depth == 0 and not is_wait(name):
-                leaders[name] += dur
+            overlap = max(min(ts + dur, frames[-1][2]) - max(ts, frames[0][1]), 0.0) if frames else dur
+            if overlap > 0:
+                totals[name] += overlap
+                if depth == 0:
+                    traced += overlap
+                    if not is_wait(name):
+                        leaders[name] += overlap
+                if is_wait(name) and not nested:
+                    waited += overlap
             if is_wait(name) and not nested:
                 waits.append((dur, name, trace.name(tid), ts))
         threads.append({"thread": trace.name(tid), "busy_ms_per_frame": (traced - waited) / 1000.0 / count,
@@ -273,11 +280,12 @@ def digest_intervals(lines):
     for line in lines:
         workers = line.get("worker_busy_pct", {})
         busiest = max(workers.items(), key=lambda entry: entry[1]) if workers else None
-        phases = list(line.get("top_phases_ms_per_frame", {}).items())
+        phases = line.get("top_phases_ms_per_frame", {})
+        largest = max(phases.items(), key=lambda entry: entry[1]) if phases else None
         rows.append({"start_s": line["interval_start_s"], "end_s": line["interval_end_s"], "presents": line["presents"],
                      "frame_ms": line["frame_ms"], "gpu_busy_ms_per_present": line["gpu_busy_ms_per_present"],
                      "busiest_worker": {"thread": busiest[0], "pct": busiest[1]} if busiest else None,
-                     "top_phase": {"name": phases[0][0], "ms_per_frame": phases[0][1]} if phases else None,
+                     "top_phase": {"name": largest[0], "ms_per_frame": largest[1]} if largest else None,
                      "trace_dropped": line.get("trace_dropped", False)})
     first = lines[0] if lines else {}
     keys = ("commit", "dirty", "env", "gpu", "driver", "os", "resolution")
@@ -324,6 +332,8 @@ def main(arguments=None):
     parser.add_argument("--top", type=nonnegative_integer, default=10, help="entries per list (default 10)")
     parser.add_argument("--json", action="store_true", help="print the digest as JSON")
     options = parser.parse_args(arguments)
+    if options.summary and not Path(options.summary).is_file():
+        parser.error(f"summary file not found: {options.summary}")
     if options.trace.endswith(".jsonl"):
         result = digest_intervals(load_intervals(options.trace))
         sys.stdout.write(json.dumps(result, indent=1) + "\n" if options.json else markdown_intervals(result))
@@ -341,4 +351,8 @@ def main(arguments=None):
 if __name__ == "__main__":
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except (EOFError, OSError, ValueError, zlib.error) as error:
+        print(f"FAIL: {error}", file=sys.stderr)
+        sys.exit(2)

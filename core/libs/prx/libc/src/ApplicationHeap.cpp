@@ -51,10 +51,13 @@ int APS5_VABI defaultPosixAlign(void** pointer, std::size_t alignment, std::size
     catch (const std::length_error&) { return 12; }
 }
 
+int APS5_VABI defaultStatsFast(void* stats) { return GuestHeap::GuestHeapStatsFast_nid_postfix(stats); }
+
 std::array<void*, 10> defaultApi() {
     return {reinterpret_cast<void*>(defaultAllocate), reinterpret_cast<void*>(defaultFree),
         reinterpret_cast<void*>(defaultCalloc), reinterpret_cast<void*>(defaultReallocate),
-        reinterpret_cast<void*>(defaultAlign), nullptr, reinterpret_cast<void*>(defaultPosixAlign)};
+        reinterpret_cast<void*>(defaultAlign), nullptr, reinterpret_cast<void*>(defaultPosixAlign), nullptr,
+        reinterpret_cast<void*>(defaultStatsFast)};
 }
 
 class CallbackScope {
@@ -153,6 +156,10 @@ void ApplicationHeapInitialize_nid_no_patch(const void* processParameters) {
             const auto* replacement = read<const void*>(libcParameters, 0x30);
             if (read<std::uint64_t>(replacement, 0) != 0x78 || read<std::uint64_t>(replacement, 8) != 2) throw std::runtime_error("application heap: unsupported allocator replacement table");
             std::array<void*, 10> api;
+            if (ApplicationGuestHeapApi_nid_no_patch(api.data())) {
+                ApplicationHeapRegister_nid_no_patch(api.data());
+                return;
+            }
             std::memcpy(api.data(), static_cast<const std::byte*>(replacement) + 0x20, sizeof(api));
             ApplicationHeapRegister_nid_no_patch(api.data());
             const auto initialize = read<Initialize>(replacement, 0x10);

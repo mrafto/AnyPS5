@@ -234,7 +234,7 @@ void TraceKeyStore(const char* path, std::uint64_t begin, std::size_t count) {
 bool StoreUncompressedOnGpu(const Context& context, Recorder& recorder, std::uint64_t begin, std::size_t count) {
     const auto* import = HostImportFor(context, begin, count);
     if (import == nullptr) return false;
-    const VkDeviceSize first = begin - import->base;
+    const VkDeviceSize first = HostImportOffset(*import, begin);
     const VkDeviceSize last = first + count;
     const VkDeviceSize fillBegin = std::min((first + 3) & ~VkDeviceSize{3}, last);
     const VkDeviceSize fillEnd = std::max(last & ~VkDeviceSize{3}, fillBegin);
@@ -502,9 +502,9 @@ DccKeys readDccKeys(std::uint64_t metaAddress, std::size_t count, bool& memoized
             return DccKeys::Mixed;
         }
         PublishShadow(metaAddress, count, PublishScope::Whole, PublishReason::Keys);
-        if (auto* recorder = Recorder::Active()) {
+        if (auto* recorder = Recorder::Active(); recorder != nullptr && recorder->PendingWriteOverlaps(metaAddress, count)) {
             Recorder::CountSync(2);
-            recorder->Sync();
+            recorder->SyncThrough(metaAddress, count);
         }
     }
     const auto* keys = reinterpret_cast<const std::uint8_t*>(metaAddress);
@@ -578,6 +578,25 @@ DccKeys CurrentDccKeys(std::uint64_t metaAddress, std::uint64_t surfaceBytes, st
     Require(keyCount >= DccKeyBytes(surfaceBytes), "a DCC key range covers fewer keys than one per 256 surface bytes");
     bool memoized = false;
     return currentDccKeys(metaAddress, keyCount, memoized);
+}
+
+std::optional<std::uint8_t> CurrentUniformMetadataByte(std::uint64_t address, std::size_t bytes) {
+    if (address == 0 || bytes == 0 || !GuestMemory::Accessible(reinterpret_cast<const void*>(address), bytes)) return std::nullopt;
+    if (GuestMemory::GpuMutex().HeldByThisThread()) {
+        if (AnyShadowedOverlaps(address, bytes)) PublishShadow(address, bytes, PublishScope::Whole, PublishReason::Keys);
+        if (auto* recorder = Recorder::Active(); recorder != nullptr && (recorder->PendingWriteOverlaps(address, bytes) || AnyShadowedOverlaps(address, bytes))) {
+            const auto landed = KeysAfterPendingWrites(*recorder, address, bytes);
+            if (landed.mixed) return std::nullopt;
+            if (!landed.unknown && landed.value >= 0 && !AnyShadowedOverlaps(address, bytes)) return static_cast<std::uint8_t>(landed.value);
+            Recorder::CountSync(2);
+            recorder->Sync();
+        }
+    }
+    std::vector<std::byte> data(bytes);
+    GuestMemory::Read(address, data);
+    const auto first = data.front();
+    if (!std::all_of(data.begin(), data.end(), [&](std::byte value) { return value == first; })) return std::nullopt;
+    return std::to_integer<std::uint8_t>(first);
 }
 
 std::optional<DccKeys> KnownPendingDccKeys(std::uint64_t metaAddress, std::uint64_t surfaceBytes) {
@@ -761,13 +780,62 @@ bool PendingFillsLeaveUncompressed(const Recorder& recorder, const GuestTextureR
 
 }
 
+namespace {
+
+struct KeyWaitTotals {
+    std::atomic<std::uint64_t> calls{0};
+    std::atomic<std::uint64_t> noPending{0};
+    std::atomic<std::uint64_t> known{0};
+    std::atomic<std::uint64_t> fillsUncompressed{0};
+    std::atomic<std::uint64_t> synced{0};
+};
+
+KeyWaitTotals& KeyWaits() {
+    static KeyWaitTotals totals;
+    return totals;
+}
+
+}
+
+DccKeyWaitCounts KeyWaitCounts() {
+    const auto& totals = KeyWaits();
+    return {totals.calls.load(std::memory_order_relaxed), totals.noPending.load(std::memory_order_relaxed), totals.known.load(std::memory_order_relaxed), totals.fillsUncompressed.load(std::memory_order_relaxed), totals.synced.load(std::memory_order_relaxed)};
+}
+
+bool DccKeyWritersPending(std::uint64_t metaAddress, std::size_t count) {
+    if (metaAddress == 0 || count == 0 || !Recorder::SnapshotWriteOverlaps(metaAddress, count)) return false;
+    auto& memo = Memo();
+    std::lock_guard lock(memo.mutex);
+    MemoRecorder(memo);
+    return std::none_of(memo.entries.begin(), memo.entries.end(), [&](const GpuKeyStore& store) { return store.note != 0 && store.begin <= metaAddress && metaAddress + count <= store.end; });
+}
+
+bool DccKeyWriterNeedsSync(std::uint64_t metaAddress, std::size_t count) {
+    if (metaAddress == 0 || count == 0 || !GuestMemory::GpuMutex().HeldByThisThread()) return false;
+    auto* recorder = Recorder::Active();
+    return recorder != nullptr && recorder->PendingWriteOverlaps(metaAddress, count) && !PendingStoreKeys(*recorder, metaAddress, count).has_value();
+}
+
 std::optional<DccKeys> WaitForKeyWriters(const GuestTextureResource& resource, std::uint64_t guestBytes) {
     const auto count = static_cast<std::size_t>(guestBytes / KeyBytes);
     const auto metaAddress = resource.dccAddress;
     if (metaAddress == 0 || count == 0 || !GuestMemory::GpuMutex().HeldByThisThread()) return std::nullopt;
+    auto& waits = KeyWaits();
+    waits.calls.fetch_add(1, std::memory_order_relaxed);
     auto* recorder = Recorder::Active();
-    if (recorder == nullptr || !recorder->PendingWriteOverlaps(metaAddress, count) || PendingStoreKeys(*recorder, metaAddress, count).has_value()) return std::nullopt;
-    if (PendingFillsLeaveUncompressed(*recorder, resource, count)) return DccKeys::Uncompressed;
+    if (recorder == nullptr || !recorder->PendingWriteOverlaps(metaAddress, count)) {
+        waits.noPending.fetch_add(1, std::memory_order_relaxed);
+        return std::nullopt;
+    }
+    if (PendingStoreKeys(*recorder, metaAddress, count).has_value()) {
+        waits.known.fetch_add(1, std::memory_order_relaxed);
+        return std::nullopt;
+    }
+    if (PendingFillsLeaveUncompressed(*recorder, resource, count)) {
+        waits.fillsUncompressed.fetch_add(1, std::memory_order_relaxed);
+        return DccKeys::Uncompressed;
+    }
+    waits.synced.fetch_add(1, std::memory_order_relaxed);
     Recorder::CountSync(2);
     recorder->SyncThrough(metaAddress, count);
     return std::nullopt;

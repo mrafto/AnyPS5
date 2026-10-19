@@ -20,11 +20,9 @@
 
 extern "C" GuestTm* APS5_VABI localtime_s_nid_postfix(const std::int64_t* timer, GuestTm* result);
 
-namespace {
+using SonyConstraintHandler = void (APS5_VABI *)(const char* message, void* pointer, int error);
 
-using SonyConstraintHandler = void (*)(const char* message, void* pointer, int error);
-
-inline void SonyDefaultConstraintHandler(const char* message, void* pointer, int error) {
+inline void APS5_VABI SonyDefaultConstraintHandler(const char* message, void* pointer, int error) {
     (void)message;
     (void)pointer;
     (void)error;
@@ -40,6 +38,8 @@ inline SonyConstraintHandler& SonyConstraintHandlerSlot() {
     static SonyConstraintHandler handler = SonyDefaultConstraintHandler;
     return handler;
 }
+
+namespace {
 
 inline void SonyInvokeConstraintHandler(const char* message, void* pointer, int error) {
     SonyConstraintHandler handler = nullptr;
@@ -224,6 +224,20 @@ inline __int128 SonyDivti3(__int128 dividend, __int128 divisor) {
         : (unsigned __int128)divisor;
     const unsigned __int128 magnitude = SonyUdivti3(magnitudeDividend, magnitudeDivisor);
     return (__int128)(negative ? (unsigned __int128)0 - magnitude : magnitude);
+}
+
+inline __int128 SonyModti3(__int128 dividend, __int128 divisor) {
+    if (divisor == 0) throw std::runtime_error("__modti3: integer divide by zero");
+    const bool negative = dividend < 0;
+    const unsigned __int128 magnitudeDividend = negative
+        ? (unsigned __int128)0 - (unsigned __int128)dividend
+        : (unsigned __int128)dividend;
+    const unsigned __int128 magnitudeDivisor = divisor < 0
+        ? (unsigned __int128)0 - (unsigned __int128)divisor
+        : (unsigned __int128)divisor;
+    unsigned __int128 remainder = 0;
+    SonyUdivmod128(magnitudeDividend, magnitudeDivisor, &remainder);
+    return (__int128)(negative ? (unsigned __int128)0 - remainder : remainder);
 }
 
 }

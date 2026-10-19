@@ -18,4 +18,20 @@ struct OpenFileLimit {
 
 }
 
+#elif defined(_WIN32)
+
+#include <cerrno>
+#include <cstdio>
+#include <system_error>
+
+namespace {
+
+struct OpenFileLimit {
+    OpenFileLimit() {
+        if (_setmaxstdio(8192) != 8192) throw std::system_error(errno, std::generic_category(), "raise open stream limit");
+    }
+} openFileLimit;
+
+}
+
 #endif
