@@ -12,6 +12,7 @@
 namespace {
 
 constexpr int GUEST_REALTIME_CLOCK = 0;
+constexpr int PROCESS_PRIVATE = 0;
 
 int toPosix(int result) {
     if (result == 0)
@@ -54,6 +55,19 @@ int APS5_VABI pthread_rwlockattr_destroy_nid_postfix(PthreadRwlockattr* attr) {
 
 int APS5_VABI pthread_rwlockattr_init_nid_postfix(PthreadRwlockattr* attr) {
     return toPosix(scePthreadRwlockattrInit(attr));
+}
+
+int APS5_VABI pthread_rwlockattr_getpshared_nid_postfix(const PthreadRwlockattr* attr, int* pshared) {
+    if (!attr || !*attr) throw std::runtime_error("pthread_rwlockattr_getpshared: null attr");
+    if (!pshared) throw std::runtime_error("pthread_rwlockattr_getpshared: null pshared");
+    *pshared = PROCESS_PRIVATE;
+    return 0;
+}
+
+int APS5_VABI pthread_rwlockattr_setpshared_nid_postfix(PthreadRwlockattr* attr, int pshared) {
+    if (pshared != PROCESS_PRIVATE) return PosixThread::GUEST_EINVAL;
+    if (!attr || !*attr) throw std::runtime_error("pthread_rwlockattr_setpshared: null attr");
+    return 0;
 }
 
 int APS5_VABI pthread_rwlock_rdlock_nid_postfix(PthreadRwlock* rwlock) {

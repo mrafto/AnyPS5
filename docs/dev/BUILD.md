@@ -52,6 +52,35 @@ therefore tests the previous binaries and can show no effect at all.
 
 [Relinker usage and runtime layout](../user/USAGE.md).
 
+## Windows setup and troubleshooting
+
+The full build also requires Python 3 for glslang and Git for Windows with Bash for libusb's version-header generation. A minimal Git installation without Bash is insufficient for the full build.
+
+In PowerShell, prepend the supported WinLibs toolchain and Git for Windows to the current session's `PATH`. Adjust the paths for the installed locations; a Portable Git installation can be used in place of `C:\Program Files\Git`.
+
+```powershell
+$env:PATH = "C:\tools\winlibs\mingw64\bin;C:\Program Files\Git\cmd;C:\Program Files\Git\usr\bin;$env:PATH"
+```
+
+If configuration reports `Could NOT find Python3` or selects an unusable interpreter, pass the absolute path to a working Python 3 executable:
+
+```powershell
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ -DPython3_EXECUTABLE="C:/path/to/python.exe"
+```
+
+If `gen-describe.ps1` fails while generating libusb's `version_describe.h`, check the Bash path printed in the build output. A WindowsApps or System32 `bash.exe` can launch WSL and fail with `WSL_E_DEFAULT_DISTRO_NOT_FOUND` when no distribution is installed. Install Git for Windows with Bash, or use Portable Git, and put its `cmd` and `usr\bin` directories on `PATH` before retrying the build. Use Bash and `cygpath.exe` from the same Git installation.
+
+After `cmake --build build --target libs --parallel` succeeds, copy the toolchain's runtime DLLs beside the patched libraries:
+
+```powershell
+$toolchainBin = "C:\tools\winlibs\mingw64\bin"
+foreach ($runtimeName in @("libgcc_s_seh-1.dll", "libstdc++-6.dll", "libwinpthread-1.dll")) {
+    Copy-Item -LiteralPath (Join-Path $toolchainBin $runtimeName) -Destination "build/core/libs/libs"
+}
+```
+
+When preparing a title's `libs/` directory, copy these DLLs with the patched `.prx` files. The Windows runtime loader does not search `PATH` for these dependencies; missing DLLs can cause error 126 even when the `.prx` is present. See [runtime layout](../user/USAGE.md#runtime-layout).
+
 ## CMake flags
 
 Project switches accept `ON` or `OFF`:
@@ -151,7 +180,7 @@ Set `APS5_SAMPLE_WORKER=<file>` to sample queue worker 0 every millisecond (in p
 
 Set `APS5_TRACE_FRAMES=<start>:<count>` to record `<count>` presents from present `<start>` (counted from 0), or `APS5_TRACE_SECONDS=<start>:<length>` to record from the first present at least `<start>` seconds after the first present until the first present `<length>` seconds later. Both values are whole numbers and the length is above 0; a malformed value, or both switches together, fails the first present. The window opens and closes at presents.
 
-Set `APS5_TRACE_EVENTS=<count>` to change the queue-worker and presenter buffers for a frame or seconds window. The count is a whole number from 1 through 4,194,304; the default is 262,144. An invalid value fails when one of these threads first binds to the trace, before recording. Each buffer uses `count * sizeof(TraceThread::Slice)` bytes (currently 32 bytes per event): 8 MiB at the default, 96 MiB at `3145728`, and 128 MiB at the maximum, per thread. The buffers are allocated even while waiting for the window to open, and formatting the trace uses additional memory. Shader preparation keeps its explicitly sized 32,768-event buffers, and the GPU range limit stays 262,144. Summary-only sessions allocate no event buffers and do not read this setting. A larger buffer can still fill; use a shorter window or increase the count within the bound.
+Set `APS5_TRACE_EVENTS=<count>` to change the queue-worker and presenter buffers for a frame or seconds window. The count is a whole number from 1 through 4,194,304; the default is 262,144. An invalid value fails when one of these threads first binds to the trace, before recording. Each buffer uses `count * sizeof(TraceThread::Slice)` bytes (currently 32 bytes per event): 8 MiB at the default, 96 MiB at `3145728`, and 128 MiB at the maximum, per thread. The buffers are allocated even while waiting for the window to open, and formatting the trace uses additional memory. Shader preparation keeps its explicitly sized 32,768-event buffers, as does a title thread named `title` that binds one the first time it registers a shader or resolves a shader ABI. The GPU range limit stays 262,144. Summary-only sessions allocate no event buffers and do not read this setting. A larger buffer can still fill; use a shorter window or increase the count within the bound.
 
 Inside the window the queue workers and the presenter record every `PerformanceTimer` scope and stage as a complete event named after its frame timing key: `Driver.WorkerWait`, `Driver.Packet`, `Driver.Packet.draw`, `Graphics.Draw`, `Driver.Present`, `Driver.Present.inflight_wait`, `Vulkan.Retire` and so on. A slice shorter than 20 us is only counted: its time is in the thread's counter `<thread> folded` (milliseconds per present) and in the summary. A thread writes a present's counter sample at its first slice after the next present, so the last present of the window has no sample; its time is still in the summary. By default, each queue worker and presenter allocates a buffer for 262,144 events when it starts; a full buffer stops that thread's recording, sets `trace_dropped` and puts an instant event `trace buffer full` on the thread's track at the start of the first lost slice (slices are appended when their outer scope ends, so that can precede the last recorded slice by up to one outer-scope length), with the number of lost slices in `args.events_lost`. When the window closes, the presenter formats the trace once and a `ProfileOutput` writer thread writes `aps5-trace-<commit>-<pid>.json.gz` (Chrome trace-event JSON, opened by ui.perfetto.dev or chrome://tracing) and appends one line to `aps5-summary.jsonl`, both in `APS5_TRACE_DIR` or the working directory. A window that is still open when the title exits writes nothing.
 
@@ -202,6 +231,30 @@ A class range covers a command together with its own barriers. In `VulkanDevice:
 - `present-blit`: the presentation command buffer from its first to its last command, timed in its own two-query pool (`VulkanDevice::present`) and added when its slot retires (`Recorder::AddGpuTiming`). Width x height x 4 bytes of the swapchain extent.
 - `shadow-publish`: copies of unit shadow slabs into the import, with their barriers (`recordCopies` in `UnitShadow.cpp`, reached from `PublishShadow`). Copied bytes.
 - `template-refresh`: the `vkCmdUpdateBuffer` updates of a cached dispatch's changed data words, as one range from the first update to the last (`ShaderResources::refreshData`, called from `recordDispatch`). Refreshed bytes.
+
+## Guest clock scale
+
+Set `APS5_TIME_SCALE=<factor>` to scale `sceKernelGetProcessTime`, `sceKernelGetProcessTimeCounter` and `sceKernelReadTsc` from their first observed value. A positive factor below 1 slows guest time; a factor above 1 speeds it up. An unset, zero, negative or non-numeric value uses `1.0` (normal speed). On Windows, `sceKernelClockGettime` monotonic clock ids are scaled too; on Linux they return the native host monotonic clock unchanged. A title's own `rdtsc` instruction and `sceKernelGetTscFrequency` are unscaled, so dividing scaled TSC deltas by the reported real frequency gives guest-time intervals. Host sleeps and waits still take real time, so this is a diagnostic aid for titles whose frame or timeout logic depends on guest time; it does not speed up the emulator or GPU work. The setting is read once when the process starts.
+
+`APS5_PAD_INPUT_FILE` command durations and reload polling use `sceKernelGetProcessTime`, so they follow the scale. At `0.02`, a 1-second injected press lasts about 50 seconds of real time, and a new command can take up to 5 seconds to be noticed.
+
+## Driver profile lines
+
+With `APS5_PROFILE_DRAW` set (any value), the driver prints a profile line on stderr at most every 10 s. A line either counts the last 10 s (its counters are read and cleared when it is printed; the text says `(10 s)` or `over 10 s`) or counts from the start of the process (the text says `(cumulative)`). A rate is the difference of two cumulative lines divided by the time between them.
+
+| Line | Counts |
+|---|---|
+| `[rescache] revalidate` | last 10 s |
+| `[texture-cache]` | last 10 s |
+| `[pipecache]` | last 10 s |
+| `[rescache]` (hits, misses, entries) | from the start |
+| `[vk]` | from the start |
+| `[indirect]` (gpu-side, cpu-side) | from the start |
+| `[flip]` | from the start |
+| `[fill-sync]` | from the start |
+| `[buffers] descriptor elements bound` | from the start |
+
+`[gputime]` is described above and needs `APS5_PROFILE_GPU`. Other profile lines state their window in their text or are not listed here because their counters were not checked.
 
 ## Driver thread priority
 

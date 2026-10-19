@@ -9,7 +9,7 @@
 #include "general/VabiMacros.hpp"
 #include "general/ExportMacros.hpp"
 
-extern "C" void NotImplemented_nid_no_patch(const char* funcName);
+extern "C" [[noreturn]] void NotImplemented_nid_no_patch(const char* funcName);
 extern "C" void CxaFinalize_nid_no_patch(void* dsoHandle);
 extern "C" bool StopAtPrefixLetter_nid_no_patch(const char* str, char** endptr, int base);
 #ifndef _WIN32
@@ -35,6 +35,7 @@ extern "C" void RecordWrittenPath_nid_no_patch(const std::filesystem::path& path
 extern "C" std::vector<std::filesystem::path> WrittenPaths_nid_no_patch();
 extern "C" void SyncWrittenPaths_nid_no_patch();
 extern "C" void BlockPathAlias_nid_no_patch(const char* guestPrefix);
+extern "C" int DuplicateHostDescriptor_nid_no_patch(int descriptor);
 #ifdef _WIN32
 extern "C" int WindowsOpenError_nid_no_patch(unsigned long error);
 extern "C" void* HostStandardHandle_nid_no_patch(int descriptor);

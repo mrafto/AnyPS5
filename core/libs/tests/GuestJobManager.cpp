@@ -215,6 +215,20 @@ static void APS5_VABI CountJob(void* argument, std::uint32_t index) {
     ++tally.calls;
 }
 
+struct Rendezvous {
+    std::uint32_t needed;
+    std::atomic<std::uint32_t> arrived{0};
+    std::atomic<std::uint32_t> met{0};
+};
+
+static void APS5_VABI RendezvousJob(void* argument, std::uint32_t) {
+    auto& rendezvous = *static_cast<Rendezvous*>(argument);
+    ++rendezvous.arrived;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (rendezvous.arrived.load() < rendezvous.needed && std::chrono::steady_clock::now() < deadline) std::this_thread::yield();
+    if (rendezvous.arrived.load() >= rendezvous.needed) ++rendezvous.met;
+}
+
 static void DispatchCase() {
     Block block(SizeFor(4, 1, 8, 2, 2));
     ManagerObject manager;
@@ -230,6 +244,14 @@ static void DispatchCase() {
     Require(tally.calls == 1000 && single.calls == 1);
     for (const auto& count : tally.seen) Require(count == 1);
     Require(sequence->Wait() == 0);
+    Rendezvous wide{4};
+    Require(sequence->Dispatch(RendezvousJob, &wide, 4, "wide") == 0);
+    Require(sequence->Wait() == 0);
+    Require(wide.met == 4);
+    Rendezvous separate{4};
+    for (int dispatch = 0; dispatch < 4; ++dispatch) Require(sequence->Dispatch(RendezvousJob, &separate, 1, "separate") == 0);
+    Require(sequence->Wait() == 0);
+    Require(separate.met == 4);
     Require(factory->Destroy(sequence) == 0);
     Require(Shutdown(manager.storage) == 0);
 }
@@ -354,6 +376,34 @@ static void LimitsCase() {
     while (accepted < 0x3ff && (result = sequence->Dispatch(Nothing, nullptr, 1, nullptr)) == 0) ++accepted;
     Require(result == NoNodes && accepted == 33);
     Require(sequence->Dispatch(Nothing, nullptr, 1, nullptr) == Invalid);
+    Require(sequence->Wait() == Invalid);
+    Require(factory->Destroy(sequence) == 0);
+    Require(factory->Create(&sequence, 0x7fff, 0x3ff, 0xff, 10, "recycle") == 0);
+    for (int cycle = 0; cycle < 5; ++cycle) {
+        for (int index = 0; index < 33; ++index) {
+            Require(sequence->Dispatch(Nothing, nullptr, 1, nullptr) == 0);
+        }
+        Require(sequence->Wait() == 0);
+    }
+    int finalAccepted = 0;
+    int finalResult = 0;
+    while (finalAccepted < 0x3ff && (finalResult = sequence->Dispatch(Nothing, nullptr, 1, nullptr)) == 0) ++finalAccepted;
+    Require(finalResult == NoNodes && finalAccepted == 33);
+    Require(sequence->Wait() == Invalid);
+    Require(factory->Destroy(sequence) == 0);
+    for (int round = 0; round < 5; ++round) {
+        Require(factory->Create(&sequence, 0x7fff, 0x3ff, 0xff, 2, "recycle_round") == 0);
+        for (int index = 0; index < 33; ++index) {
+            Require(sequence->Dispatch(Nothing, nullptr, 1, nullptr) == 0);
+        }
+        Require(sequence->Wait() == 0);
+        int acceptedInRound = 0;
+        int resultInRound = 0;
+        while (acceptedInRound < 0x3ff && (resultInRound = sequence->Dispatch(Nothing, nullptr, 1, nullptr)) == 0) ++acceptedInRound;
+        Require(resultInRound == NoNodes && acceptedInRound == 33);
+        Require(sequence->Wait() == Invalid);
+        Require(factory->Destroy(sequence) == 0);
+    }
     Require(Shutdown(manager.storage) == 0);
 }
 
@@ -417,6 +467,11 @@ static void ShutdownCase() {
         Require(Shutdown(manager.storage) == 0);
         Require(Shutdown(manager.storage) == NotInitialized);
         Require(Factories(manager.storage, 0) == nullptr);
+    }
+    {
+        Block scopedBlock(SizeFor(2, 2, 8, 2, 2));
+        ManagerObject scoped;
+        Require(Initialize(scoped.storage, scopedBlock.memory, scopedBlock.bytes, 2, 2, nullptr) == 0);
     }
 }
 

@@ -33,6 +33,7 @@ struct Voice {
     std::mutex mutex;
     bool initialized = false;
     bool started = false;
+    bool chatEnabled = false;
     std::uint32_t nextId = 0;
     std::map<std::uint32_t, Port> ports;
     std::set<std::pair<std::uint32_t, std::uint32_t>> connections;
@@ -99,6 +100,7 @@ int APS5_VABI sceVoiceEnd_nid_postfix(void) {
     voice.ports.clear();
     voice.connections.clear();
     voice.started = false;
+    voice.chatEnabled = false;
     voice.initialized = false;
     return 0;
 }
@@ -225,13 +227,24 @@ int APS5_VABI sceVoiceGetMuteFlag(uint32_t port_id, bool* muted) {
     return 0;
 }
 
-int APS5_VABI sceVoiceGetResourceInfo(void) {
-    NotImplemented_nid_no_patch(__func__);
+int APS5_VABI sceVoiceGetResourceInfo(VoiceResourceInfo* info) {
+    if (info == nullptr) APS5_INVALID_ARG_EX;
+    auto& voice = State();
+    std::lock_guard lock(voice.mutex);
+    if (!voice.initialized) Fail(__func__, "library not initialized");
+    info->max_voice_input_ports = 7;
+    info->max_voice_output_ports = 7;
+    info->max_device_input_ports = 1;
+    info->max_device_output_ports = 1;
+    info->max_ports = 64;
     return 0;
 }
 
 int APS5_VABI sceVoiceEnableChat(void) {
-    NotImplemented_nid_no_patch(__func__);
+    auto& voice = State();
+    std::lock_guard lock(voice.mutex);
+    if (!voice.initialized) Fail(__func__, "library not initialized");
+    voice.chatEnabled = true;
     return 0;
 }
 
@@ -243,7 +256,10 @@ int APS5_VABI sceVoiceResetPort(uint32_t port_id) {
 }
 
 int APS5_VABI sceVoiceDisableChat(void) {
-    NotImplemented_nid_no_patch(__func__);
+    auto& voice = State();
+    std::lock_guard lock(voice.mutex);
+    if (!voice.initialized) Fail(__func__, "library not initialized");
+    voice.chatEnabled = false;
     return 0;
 }
 

@@ -9,6 +9,8 @@ int APS5_VABI scePthreadJoin(Pthread thread, void** retval);
 int APS5_VABI scePthreadSetprio(Pthread thread, int prio);
 int APS5_VABI scePthreadSetaffinity(Pthread thread, KernelCpumask mask);
 int APS5_VABI scePthreadAttrInit(PthreadAttr* attr);
+int APS5_VABI Aps5PthreadAttrSetSchedulingRole_nid_no_patch(PthreadAttr* attr, std::uint32_t role);
+std::uint32_t APS5_VABI Aps5PthreadGetSchedulingRole_nid_no_patch(Pthread thread);
 int APS5_VABI scePthreadAttrDestroy(PthreadAttr* attr);
 int APS5_VABI scePthreadAttrGet(Pthread thread, PthreadAttr* attr);
 int APS5_VABI scePthreadAttrSetinheritsched(PthreadAttr* attr, int inheritSched);
@@ -256,12 +258,40 @@ static void CheckThreadScope() {
     Require(scePthreadJoin(inheritedThread, nullptr) == SCE_OK);
 }
 
+static void CheckSchedulingRole() {
+    PthreadAttr roleAttr = nullptr;
+    Require(Aps5PthreadAttrSetSchedulingRole_nid_no_patch(&roleAttr, 1) == SCE_KERNEL_ERROR_EINVAL);
+    Require(Aps5PthreadAttrSetSchedulingRole_nid_no_patch(nullptr, 1) == SCE_KERNEL_ERROR_EINVAL);
+    Require(scePthreadAttrInit(&roleAttr) == SCE_OK);
+    Require(Aps5PthreadAttrSetSchedulingRole_nid_no_patch(&roleAttr, 2) == SCE_KERNEL_ERROR_EINVAL);
+
+    std::promise<void> release;
+    auto released = release.get_future();
+    Pthread plain = nullptr;
+    Require(scePthreadCreate(&plain, &roleAttr, Worker, &released, "BPE JobWorkerThread CPU0") == SCE_OK);
+    Require(Aps5PthreadGetSchedulingRole_nid_no_patch(plain) == 0);
+    release.set_value();
+    Require(scePthreadJoin(plain, nullptr) == SCE_OK);
+
+    Require(Aps5PthreadAttrSetSchedulingRole_nid_no_patch(&roleAttr, 1) == SCE_OK);
+    std::promise<void> releaseWorker;
+    auto releasedWorker = releaseWorker.get_future();
+    Pthread worker = nullptr;
+    Require(scePthreadCreate(&worker, &roleAttr, Worker, &releasedWorker, "renamed") == SCE_OK);
+    Require(Aps5PthreadGetSchedulingRole_nid_no_patch(worker) == 1);
+    releaseWorker.set_value();
+    Require(scePthreadJoin(worker, nullptr) == SCE_OK);
+    Require(scePthreadAttrDestroy(&roleAttr) == SCE_OK);
+    Require(Aps5PthreadGetSchedulingRole_nid_no_patch(nullptr) == 0);
+}
+
 int main() {
     CheckStackSizeLimit();
     CheckSoloSched();
     CheckSchedArguments();
     CheckSchedulingAttributes();
     CheckThreadScope();
+    CheckSchedulingRole();
     PthreadAttr attr = nullptr;
     Require(scePthreadAttrInit(&attr) == SCE_OK);
     Require(scePthreadAttrSetinheritsched(&attr, EXPLICIT_SCHED) == SCE_OK);

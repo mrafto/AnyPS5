@@ -94,6 +94,7 @@ void EmitReturnTerminator(SpirvValueEmitContext& ctx) {
         state.module.AddFunction(spv::OpEndInvocationInterlockEXT);
     }
     EmitKillIfPixelValidMaskInactive(state);
+    if (state.quadPixelUncovered != 0u) EmitKillIfBoolFalse(state, Unary(state, spv::OpLogicalNot, TypeBool(state), state.quadPixelUncovered));
     if (state.stencilReplay) {
         const auto value = state.module.AllocateId();
         state.module.AddFunction(spv::OpLoad, TypeI32(state), value, state.stencilRefVariable);
@@ -808,6 +809,25 @@ bool CommunicatesThroughMemory(IrOpcode opcode) {
     return SharedAccessOf(opcode) != SharedAccess::None || buffer == BufferAccess::Write || buffer == BufferAccess::Atomic || address == AddressAccess::Write || address == AddressAccess::Atomic || image == ImageAccess::Write || image == ImageAccess::Atomic;
 }
 
+bool AccessesMemory(IrOpcode opcode) {
+    return opcode == IrOpcode::ReadConst || opcode == IrOpcode::ReadConstBuffer || SharedAccessOf(opcode) != SharedAccess::None || BufferAccessOf(opcode) != BufferAccess::None || AddressOpcodeInfoOf(opcode).access != AddressAccess::None || ImageOpcodeInfoOf(opcode).access != ImageAccess::None;
+}
+
+bool PrecedesEveryMemoryAccess(const IrProgram& program, const IrValue& barrier) {
+    const auto& blocks = program.BlockOrder();
+    const IrBlock* block = blocks.empty() ? nullptr : blocks.front();
+    for (std::size_t steps = 0; block != nullptr && steps < blocks.size(); ++steps) {
+        for (const auto* instruction : block->Instructions()) {
+            if (instruction == &barrier) return true;
+            if (AccessesMemory(instruction->Opcode())) return false;
+        }
+        if (block->Successors().size() != 1u) return false;
+        block = block->Successors().front();
+        if (block->Predecessors().size() != 1u) return false;
+    }
+    return false;
+}
+
 }
 
 void EmitControlFlow(SpirvModule& module, const IrProgram& program) {
@@ -864,6 +884,7 @@ void EmitVoid(SpirvValueEmitContext&) {
 void EmitBarrier(SpirvValueEmitContext& ctx, const IrValue& inst) {
     auto& state = ctx.state;
     if (state.program.Resources().stage == IrShaderStage::Vertex) {
+        if (PrecedesEveryMemoryAccess(state.program, inst)) return;
         for (const auto* block : state.program.BlockOrder()) {
             for (const auto* instruction : block->Instructions()) {
                 if (CommunicatesThroughMemory(instruction->Opcode())) ctx.Fail(inst, "s_barrier in a vertex program that accesses LDS or GDS or writes memory is not implemented");

@@ -1,4 +1,5 @@
 #include "prx/libkernel/Pthread/include/Pthread.hpp"
+#include "prx/libc/include/CpuTopology.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libkernel/KernelErrors.hpp"
 #include <stdexcept>
@@ -30,6 +31,16 @@ int APS5_VABI scePthreadAttrInit(PthreadAttr* attr) {
     p->_inheritsched = 4;
     *attr = p;
     return SCE_OK;
+}
+
+int APS5_VABI Aps5PthreadAttrSetSchedulingRole_nid_no_patch(PthreadAttr* attr, std::uint32_t role) {
+    if (!attr || !*attr || !CpuTopology::ValidRole(role)) return SCE_KERNEL_ERROR_EINVAL;
+    (*attr)->_schedulingRole = role;
+    return SCE_OK;
+}
+
+std::uint32_t APS5_VABI Aps5PthreadGetSchedulingRole_nid_no_patch(Pthread thread) {
+    return thread ? thread->schedulingRole : 0;
 }
 
 int APS5_VABI scePthreadAttrDestroy(PthreadAttr* attr) {

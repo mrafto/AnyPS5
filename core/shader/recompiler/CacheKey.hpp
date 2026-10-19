@@ -52,6 +52,7 @@ public:
         append(key, request.context.pixel);
         append(key, request.context.vertex);
         append(key, request.context.floatMode);
+        append(key, request.context.convertedSamples);
         appendFallbacks(key, request);
         appendMesh(key, request);
         appendTessellation(key, request);
@@ -85,6 +86,7 @@ private:
         append(key, request.context.pixel);
         append(key, request.context.vertex);
         append(key, request.context.floatMode);
+        append(key, request.context.convertedSamples);
         appendFallbacks(key, request);
         appendMesh(key, request);
         appendTessellation(key, request);
@@ -193,6 +195,9 @@ private:
         append(key, value.ditheredAlphaToCoverage);
         append(key, value.quadPixelMask);
         append(key, value.quadSampleMask);
+        append(key, value.iteratesSamples);
+        append(key, value.positionLocation);
+        append(key, value.sampleLocations);
         append(key, value.targetOutputMode);
     }
 
@@ -208,6 +213,7 @@ private:
         append(key, value.fetchBufferReg);
         append(key, value.fetchEmbedded);
         append(key, value.paClVsOutCntl);
+        append(key, value.depthRemapMode);
         if (value.resourcesNum > value.resources.size()) throw std::runtime_error("Shader cache: invalid vertex resource count");
         append(key, value.resourcesNum);
         for (std::uint32_t i = 0; i < value.resourcesNum; ++i) {
@@ -257,11 +263,14 @@ private:
         append(key, value.srgbDecodeFormats);
         append(key, value.narrowSubgroupClock);
         append(key, value.float64DenormPreserve);
+        append(key, value.depthRangeRemap);
         append(key, value.registrationModules);
         append(key, value.registrationWordLimit);
         append(key, value.vertexSubgroups);
         append(key, value.float16DenormPreserve);
         append(key, value.spannedWaves);
+        append(key, value.robustBufferAccess2);
+        append(key, value.float32FlushToZero);
     }
 };
 

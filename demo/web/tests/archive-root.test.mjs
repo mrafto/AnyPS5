@@ -4,7 +4,7 @@ import { pathToFileURL } from "node:url";
 import path from "node:path";
 
 register("./cdn-loader.mjs", import.meta.url, { data: { url: process.env.ANYPS5_TEST_ZIP_URL, path: process.env.ANYPS5_TEST_ZIP_PATH } });
-const { Archive } = await import(pathToFileURL(path.join(process.argv[2], "archive.mjs")));
+const { Archive, DirectoryWriter } = await import(pathToFileURL(path.join(process.argv[2], "archive.mjs")));
 const { BlobWriter, Uint8ArrayReader, ZipWriter } = await import(process.env.ANYPS5_TEST_ZIP_URL);
 const header = new Uint8Array([127, 69, 76, 70]);
 
@@ -181,6 +181,56 @@ for (const directories of [[], parents, [...parents].reverse()]) {
   } finally { await archive.close(); }
 }
 
+{
+  const originalFetch = globalThis.fetch;
+  const originalSelf = globalThis.self;
+  globalThis.self = { postMessage() {} };
+  try {
+    const { downloadLibraries } = await import(pathToFileURL(path.join(process.argv[2], "worker.mjs")));
+    const bytes = Uint8Array.from({ length: 32 }, (_, index) => index);
+    const sha256 = [...new Uint8Array(await crypto.subtle.digest("SHA-256", bytes))].map(byte => byte.toString(16).padStart(2, "0")).join("");
+    const asset = { path: "libraries/linux-1234.zip", size: bytes.length, expandedBytes: 100, sha256 };
+    let cancelled = false;
+    let pulled = 0;
+    const configureDownload = (chunks, size = bytes.length) => {
+      cancelled = false;
+      pulled = 0;
+      globalThis.fetch = async url => {
+        if (url === "./release.json") return Response.json({ tag: "v1", platforms: { linux: { ...asset, size } } });
+        if (url.startsWith("https://api.github.com/")) return Response.json({ tag_name: "v1" });
+        return new Response(new ReadableStream({
+          pull(controller) {
+            if (pulled < chunks.length) controller.enqueue(chunks[pulled++]);
+            else controller.close();
+          },
+          cancel() { cancelled = true; }
+        }));
+      };
+    };
+    configureDownload(Array.from({ length: 8 }, () => bytes));
+    await assert.rejects(downloadLibraries("linux"), /System library download is incomplete/);
+    assert.equal(cancelled, true);
+    assert(pulled < 8);
+    for (const chunks of [[], [bytes.subarray(0, 31)]]) {
+      configureDownload(chunks);
+      await assert.rejects(downloadLibraries("linux"), /System library download is incomplete/);
+    }
+    configureDownload([bytes.subarray(0, 3), bytes.subarray(3)]);
+    const downloaded = await downloadLibraries("linux");
+    assert.deepEqual(new Uint8Array(await downloaded.file.arrayBuffer()), bytes);
+    assert.equal(downloaded.expandedBytes, 100);
+    for (const size of [-1, 1.5, 512 * 1024 * 1024 + 1]) {
+      configureDownload([bytes], size);
+      await assert.rejects(downloadLibraries("linux"), /Invalid release manifest/);
+      assert.equal(pulled, 0);
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalSelf === undefined) delete globalThis.self;
+    else globalThis.self = originalSelf;
+  }
+}
+
 const folder = new Archive([{ path: "outer/inner/title/main.elf", file: new Blob([header]) }]);
 try { assert.equal((await folder.inspect(() => {})).root, "outer/inner/title/"); }
 finally { await folder.close(); }
@@ -188,3 +238,51 @@ finally { await folder.close(); }
 const siblings = new Archive(await zipped([["outer/", true], ["outer/main.elf", false], ["other/resource", false]]));
 try { await assert.rejects(siblings.inspect(() => {}), /exactly one executable ELF/); }
 finally { await siblings.close(); }
+
+for (const cleanupRejects of [false, true]) {
+  const failure = new Error("input read failed");
+  let aborted = false;
+  const output = new WritableStream({ abort(reason) {
+    aborted = true;
+    assert.equal(reason, failure);
+    if (cleanupRejects) throw new Error("abort failed");
+  } });
+  const source = new ReadableStream({ start(controller) { controller.error(failure); } });
+  const writer = new DirectoryWriter({ async file() { return output; } });
+  await assert.rejects(writer.add("example.bin", source), error => error === failure);
+  assert.equal(aborted, true);
+  assert.equal(output.locked, false);
+  assert.equal(source.locked, false);
+}
+
+{
+  const failure = new Error("progress failed");
+  let cancelled = false;
+  let aborted = false;
+  const source = new ReadableStream({
+    start(controller) { controller.enqueue(new Uint8Array([1])); },
+    cancel(reason) { cancelled = true; assert.equal(reason, failure); throw new Error("cancel failed"); }
+  });
+  const output = new WritableStream({ abort(reason) { aborted = true; assert.equal(reason, failure); } });
+  const writer = new DirectoryWriter({ async file() { return output; } });
+  await assert.rejects(writer.add("example.bin", source, { onprogress() { throw failure; } }), error => error === failure);
+  assert.equal(cancelled, true);
+  assert.equal(aborted, true);
+  assert.equal(output.locked, false);
+  assert.equal(source.locked, false);
+}
+
+{
+  const failure = new Error("blob read failed");
+  let aborted = false;
+  const output = new WritableStream({ abort(reason) {
+    aborted = true;
+    assert.equal(reason, failure);
+    throw new Error("abort failed");
+  } });
+  const source = { size: 1, async init() {}, async readUint8Array() { throw failure; } };
+  const writer = new DirectoryWriter({ async file() { return output; } });
+  await assert.rejects(writer.add("example.bin", source), error => error === failure);
+  assert.equal(aborted, true);
+  assert.equal(output.locked, false);
+}

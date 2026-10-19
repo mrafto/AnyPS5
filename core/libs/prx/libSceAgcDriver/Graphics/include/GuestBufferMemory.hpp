@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <span>
@@ -40,7 +41,16 @@ struct HostImport {
     bool joined = false;
     std::shared_ptr<void> chunk;
     mutable std::uint64_t lastUse = 0;
+    std::uint64_t lead = 0;
+    std::uint64_t memoryBase = 0;
+    std::uint64_t pinnedBytes = 0;
+    std::uint32_t memoryType = std::numeric_limits<std::uint32_t>::max();
+    std::uint64_t backingSerial = 0;
 };
+
+inline VkDeviceSize HostImportOffset(const HostImport& import, std::uint64_t address) {
+    return address - import.base + import.lead;
+}
 
 enum class ImportWatch : std::uint8_t { Watch, Unwatch };
 
@@ -63,15 +73,29 @@ ImportWatch PrepareImportWatch(const Context& context);
 void SetImportWatch(const Context& context, ImportWatch watch);
 
 // The host import of the registered allocation containing [address, address + bytes), made on demand
-// (alignment and budget permitting), or null. Bytes at `address` are at `address - import->base` in
-// the import's buffer.
+// (alignment and budget permitting), or null. Bytes at `address` are at `HostImportOffset(*import,
+// address)` in the import's buffer.
 const HostImport* HostImportFor(const Context& context, std::uint64_t address, std::size_t bytes);
 const HostImport* ExistingHostImportFor(const Context& context, std::uint64_t address, std::size_t bytes);
 void SetHostImportWindow(std::uint64_t bytes);
 // Tests: the window of one large registered range (64 MiB) and the import budget (0: the configured one).
 void SetHostImportRangeWindow(std::uint64_t bytes);
 void SetHostImportBudget(std::uint64_t bytes);
+void SetAddressCopyLimit(std::uint64_t bytes);
+void SetHostImportDeferredSettles(bool enabled);
+// The larger of 6 GiB and half the physical memory, at most the largest host heap less the larger of 2 GiB and half
+// that heap: the other half stays for the buffers, mirrors and textures that share it.
+std::uint64_t HostImportBudget(const VkPhysicalDeviceMemoryProperties& memory, std::uint64_t physicalBytes);
 std::uint64_t HostImportLiveBytes();
+struct HostImportSettleCounts {
+    std::uint64_t submitted = 0;
+    std::uint64_t waited = 0;
+    std::uint64_t rewatched = 0;
+    std::uint64_t parked = 0;
+    std::uint64_t unmapWaits = 0;
+    std::uint64_t keptCompared = 0;
+};
+HostImportSettleCounts HostImportSettles();
 // Tests: how many imports settleImport has used on the settle queue.
 std::uint64_t HostImportsSettled();
 bool ImportMappedRanges(const Context& context, const GuestAllocations::Mapped& ranges, std::uint64_t generation, bool adoptDevice);
@@ -147,6 +171,7 @@ std::uint64_t ImageMirrorSerial(const Context& context, std::uint64_t address, s
 // prints the [address-sync] leases line every 10 s from LeaseCounters (cumulative).
 bool SyncLeaseWork();
 void CountLeaseOutcome(bool synced, std::uint64_t batchSerial);
+void FinishLeaseWork();
 struct LeaseStats {
     std::uint64_t deferred = 0;
     std::uint64_t synced = 0;
@@ -308,12 +333,14 @@ public:
     // the GPU copies out of an import (gpuCopy) notes its read itself when the copy is recorded.
     // For the recorder's read tracking (ShaderResources::MarkGpuWrites); nothing once committed.
     std::vector<std::pair<std::uint64_t, std::uint64_t>> InPlaceReads() const;
+    void InPlaceReads(std::vector<std::pair<std::uint64_t, std::uint64_t>>& out) const;
     struct SplitReads {
         std::shared_ptr<const std::vector<std::pair<std::uint64_t, std::uint64_t>>> space;
         std::vector<std::pair<std::uint64_t, std::uint64_t>> own;
     };
     std::optional<SplitReads> SplitInPlaceReads() const;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> DeviceReads() const;
+    void DeviceReads(std::vector<std::pair<std::uint64_t, std::uint64_t>>& out) const;
 
 private:
     struct Region {

@@ -193,16 +193,35 @@ std::uint64_t Driver::drawRegisterKey(const QueueState& queue, const ShaderRegis
     return key;
 }
 
-void Driver::traceDrawKeyLookup(const std::array<std::uint64_t, 5>& components, bool cacheMiss) {
+void Driver::traceDrawKeyLookup(const QueueState& queue, const std::array<std::uint64_t, 5>& components, bool cacheMiss) {
     if (!traceDrawCache()) return;
-    struct Previous { std::array<std::uint64_t, 4> parts{}; };
+    struct Previous {
+        std::array<std::uint64_t, 4> parts{};
+        std::vector<std::pair<std::uint32_t, std::uint32_t>> words;
+    };
     struct PreviousStorage {};
     auto& previous = HostThreadLocal<std::unordered_map<std::uint64_t, Previous>, PreviousStorage>();
     const auto shaderSet = components[4];
     if (previous.size() >= 2048 && previous.find(shaderSet) == previous.end()) previous.clear();
     const auto [it, inserted] = previous.try_emplace(shaderSet);
-    if (!cacheMiss) { it->second.parts = {components[0], components[1], components[2], components[3]}; return; }
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> words;
+    forEachKeyedUserWord(queue, false, [&](std::uint32_t offset, std::uint32_t value) { words.emplace_back(offset, value); });
+    if (!cacheMiss) {
+        it->second.parts = {components[0], components[1], components[2], components[3]};
+        it->second.words = std::move(words);
+        return;
+    }
     auto& counters = drawEntryCounters;
+    if (!inserted) {
+        for (const auto& [offset, value] : words) {
+            const auto before = std::find_if(it->second.words.begin(), it->second.words.end(), [&](const auto& word) { return word.first == offset; });
+            if (before == it->second.words.end() || before->second == value || offset >= counters.userWordChanges.size()) continue;
+            ++counters.userWordChanges[offset];
+            const auto delta = value > before->second ? value - before->second : before->second - value;
+            if (delta < 0x100000u) ++counters.userWordNearChanges;
+            else ++counters.userWordFarChanges;
+        }
+    }
     if (inserted) ++counters.registerKeyMissChanges[4];
     else {
         bool changed = false;
@@ -210,10 +229,12 @@ void Driver::traceDrawKeyLookup(const std::array<std::uint64_t, 5>& components, 
         if (!changed) ++counters.registerKeyMissChanges[5];
     }
     it->second.parts = {components[0], components[1], components[2], components[3]};
+    it->second.words = std::move(words);
 }
 
 bool Driver::sameVertexInfo(const ShaderRecompiler::ShaderVertexStageInfo& a, const ShaderRecompiler::ShaderVertexStageInfo& b) {
     if (a.resourcesNum != b.resourcesNum || a.fetchAttribReg != b.fetchAttribReg || a.fetchBufferReg != b.fetchBufferReg || a.fetchEmbedded != b.fetchEmbedded || a.paClVsOutCntl != b.paClVsOutCntl) return false;
+    if (a.depthRemapMode != b.depthRemapMode) return false;
     for (std::uint32_t i = 0; i < a.resourcesNum && i < a.resources.size(); ++i) {
         if (a.resources[i].fields != b.resources[i].fields) return false;
         const auto& x = a.resourcesDst[i];
@@ -261,8 +282,8 @@ bool Driver::sameDecode(const DrawDecode& a, const DrawDecode& b) {
         const auto& y = b.programs[i];
         if (x.binary.stage != y.binary.stage || x.binary.codeAddress != y.binary.codeAddress || x.userDataBase != y.userDataBase || x.firstUserSgpr != y.firstUserSgpr || x.userData != y.userData || x.snapshot != y.snapshot || x.codeOffset != y.codeOffset || x.tailContinuation != y.tailContinuation) return false;
     }
-    if (p.targetExportPacking != q.targetExportPacking || p.dualSourceBlend != q.dualSourceBlend || p.reversedBlend != q.reversedBlend || p.alphaToCoverage != q.alphaToCoverage || p.rasterPrimitive != q.rasterPrimitive || p.ditheredAlphaToCoverage != q.ditheredAlphaToCoverage || p.quadPixelMask != q.quadPixelMask || p.quadSampleMask != q.quadSampleMask) return false;
-    if (s.samples != t.samples || s.quadSampleMask != t.quadSampleMask || s.pixelEarlyZ != t.pixelEarlyZ) return false;
+    if (p.targetExportPacking != q.targetExportPacking || p.dualSourceBlend != q.dualSourceBlend || p.reversedBlend != q.reversedBlend || p.alphaToCoverage != q.alphaToCoverage || p.rasterPrimitive != q.rasterPrimitive || p.ditheredAlphaToCoverage != q.ditheredAlphaToCoverage || p.quadPixelMask != q.quadPixelMask || p.quadSampleMask != q.quadSampleMask || p.iteratesSamples != q.iteratesSamples || p.positionLocation != q.positionLocation || p.sampleLocations != q.sampleLocations) return false;
+    if (s.samples != t.samples || s.mergedCoverage != t.mergedCoverage || s.quadSampleMask != t.quadSampleMask || s.pixelEarlyZ != t.pixelEarlyZ) return false;
     return true;
 }
 

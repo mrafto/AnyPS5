@@ -814,6 +814,228 @@ void TestBatchWaitRelease(std::uint32_t context) {
     Require(sceAjmBatchWait(context, second + 1, 0, &error) == invalidBatch);
 }
 
+void TestMalformedBatch(std::uint32_t context) {
+    constexpr int invalidParameter = static_cast<int>(0x80930005);
+    constexpr std::size_t headerBytes = 32;
+    std::uint32_t instance = 0;
+    Require(sceAjmInstanceCreate(context, 0, 0, &instance) == 0);
+    std::vector<std::uint8_t> batch(256);
+    std::vector<std::uint8_t> first(8, 0xAA);
+    std::vector<std::uint8_t> second(8, 0xAA);
+    AjmBatchInfo info{};
+    AjmBatchError error{};
+    std::uint32_t id = 0;
+    const auto build = [&](bool withBuffers) {
+        std::fill(first.begin(), first.end(), std::uint8_t{0xAA});
+        std::fill(second.begin(), second.end(), std::uint8_t{0xAA});
+        Require(sceAjmBatchInitialize(batch.data(), batch.size(), &info) == 0);
+        Require(sceAjmBatchJobClearContext(&info, instance, first.data()) == 0);
+        const std::size_t secondStart = static_cast<std::size_t>(info.offset);
+        if (withBuffers) {
+            std::uint8_t in[4] = {};
+            std::uint8_t out[4] = {};
+            Require(sceAjmBatchJobRun(&info, instance, 0, in, sizeof(in), out, sizeof(out), second.data(), second.size()) == 0);
+        } else {
+            Require(sceAjmBatchJobClearContext(&info, instance, second.data()) == 0);
+        }
+        return secondStart;
+    };
+    const auto rejected = [&](const AjmBatchInfo& candidate) {
+        const bool refused = sceAjmBatchStart(context, &candidate, 0, &error, &id) == invalidParameter;
+        for (const auto byte : first) Require(byte == 0xAA);
+        for (const auto byte : second) Require(byte == 0xAA);
+        return refused;
+    };
+
+    build(false);
+    Submit(context, info);
+    Require(first[0] == 0 && second[0] == 0);
+
+    std::size_t start = build(false);
+    AjmBatchInfo truncated = info;
+    truncated.offset = start + headerBytes - 1;
+    Require(rejected(truncated));
+
+    start = build(false);
+    AjmBatchInfo past = info;
+    past.offset = info.size + 1;
+    Require(rejected(past));
+
+    start = build(false);
+    batch[start + 3] = 17;
+    Require(rejected(info));
+
+    start = build(true);
+    AjmBatchInfo shortDescriptors = info;
+    shortDescriptors.offset = start + headerBytes + sizeof(AjmBuffer);
+    Require(rejected(shortDescriptors));
+
+    start = build(false);
+    std::uint32_t zero = 0;
+    std::memcpy(batch.data() + start + 28, &zero, sizeof(zero));
+    Require(rejected(info));
+
+    start = build(false);
+    std::uint32_t small = headerBytes - 1;
+    std::memcpy(batch.data() + start + 28, &small, sizeof(small));
+    Require(rejected(info));
+
+    start = build(false);
+    std::uint32_t huge = 0x7FFFFFFF;
+    std::memcpy(batch.data() + start + 28, &huge, sizeof(huge));
+    Require(rejected(info));
+
+    start = build(true);
+    batch[start + 1] = 0xFF;
+    batch[start + 2] = 0xFF;
+    Require(rejected(info));
+
+    AjmBatchInfo nullBuffer{};
+    nullBuffer.p_buffer = nullptr;
+    nullBuffer.offset = headerBytes;
+    nullBuffer.size = headerBytes;
+    Require(rejected(nullBuffer));
+
+    build(false);
+    Require(sceAjmBatchStart(context, &info, 0, &error, &id) == 0 && sceAjmBatchWait(context, id, 0, &error) == 0);
+    Require(sceAjmInstanceDestroy(context, instance) == 0);
+}
+
+struct FrameOutput {
+    std::vector<std::int16_t> pcm = std::vector<std::int16_t>(1152);
+    DecodeSideband sideband{};
+};
+
+void TestParallelInstances(std::uint32_t context) {
+    constexpr std::size_t instances = 8;
+    constexpr std::size_t framesPerInstance = 3;
+    std::uint32_t parallel[instances];
+    std::uint32_t serial[instances];
+    for (std::size_t index = 0; index < instances; ++index) {
+        Require(sceAjmInstanceCreate(context, 0, 0, &parallel[index]) == 0);
+        Require(sceAjmInstanceCreate(context, 0, 0, &serial[index]) == 0);
+    }
+    std::vector<FrameOutput> together(instances * framesPerInstance);
+    std::vector<FrameOutput> reference(instances * framesPerInstance);
+    std::vector<std::uint8_t> batch(8192);
+    AjmBatchInfo info{};
+    Require(sceAjmBatchInitialize(batch.data(), batch.size(), &info) == 0);
+    for (std::size_t frame = 0; frame < framesPerInstance; ++frame) {
+        for (std::size_t index = 0; index < instances; ++index) {
+            const std::size_t offset = 96 * (frame + index % 2);
+            auto& out = together[index * framesPerInstance + frame];
+            Require(sceAjmBatchJobDecode(&info, parallel[index], MP3_MONO + offset, 96, out.pcm.data(), out.pcm.size() * sizeof(std::int16_t), &out.sideband) == 0);
+        }
+    }
+    std::uint32_t id = 0;
+    AjmBatchError error{};
+    Require(sceAjmBatchStart(context, &info, 0, &error, &id) == 0 && sceAjmBatchWait(context, id, 0, &error) == 0);
+    for (std::size_t index = 0; index < instances; ++index) {
+        for (std::size_t frame = 0; frame < framesPerInstance; ++frame) {
+            const std::size_t offset = 96 * (frame + index % 2);
+            auto& out = reference[index * framesPerInstance + frame];
+            RunDecode(context, serial[index], MP3_MONO + offset, 96, out.pcm.data(), out.pcm.size() * sizeof(std::int16_t), out.sideband);
+        }
+    }
+    for (std::size_t index = 0; index < together.size(); ++index) {
+        Require(together[index].pcm == reference[index].pcm);
+        Require(std::memcmp(&together[index].sideband, &reference[index].sideband, sizeof(DecodeSideband)) == 0);
+        Require(together[index].sideband.totalDecodedSamples == static_cast<std::uint64_t>(index % framesPerInstance + 1) * 1152);
+    }
+    for (std::size_t index = 0; index < instances; ++index) {
+        Require(sceAjmInstanceDestroy(context, parallel[index]) == 0 && sceAjmInstanceDestroy(context, serial[index]) == 0);
+    }
+}
+
+void TestOverlappingOutputs(std::uint32_t context) {
+    for (int round = 0; round < 40; ++round) {
+        std::uint32_t instances[4];
+        for (auto& instance : instances) Require(sceAjmInstanceCreate(context, 0, 0, &instance) == 0);
+        FrameOutput batched;
+        DecodeSideband firstSideband{};
+        DecodeSideband secondSideband{};
+        std::vector<std::uint8_t> batch(1024);
+        AjmBatchInfo info{};
+        Require(sceAjmBatchInitialize(batch.data(), batch.size(), &info) == 0);
+        Require(sceAjmBatchJobDecode(&info, instances[0], MP3_MONO, 96, batched.pcm.data(), batched.pcm.size() * sizeof(std::int16_t), &firstSideband) == 0);
+        Require(sceAjmBatchJobDecode(&info, instances[1], MP3_MONO + 96 * 3, 96, batched.pcm.data(), batched.pcm.size() * sizeof(std::int16_t), &secondSideband) == 0);
+        Submit(context, info);
+        FrameOutput stepwise;
+        DecodeSideband stepFirst{};
+        DecodeSideband stepSecond{};
+        RunDecode(context, instances[2], MP3_MONO, 96, stepwise.pcm.data(), stepwise.pcm.size() * sizeof(std::int16_t), stepFirst);
+        const std::vector<std::int16_t> afterFirst = stepwise.pcm;
+        RunDecode(context, instances[3], MP3_MONO + 96 * 3, 96, stepwise.pcm.data(), stepwise.pcm.size() * sizeof(std::int16_t), stepSecond);
+        Require(afterFirst != stepwise.pcm);
+        Require(batched.pcm == stepwise.pcm);
+        Require(std::memcmp(&firstSideband, &stepFirst, sizeof(DecodeSideband)) == 0 && std::memcmp(&secondSideband, &stepSecond, sizeof(DecodeSideband)) == 0);
+        for (const auto instance : instances) Require(sceAjmInstanceDestroy(context, instance) == 0);
+    }
+}
+
+std::int32_t ClearResult(std::uint32_t context, std::uint32_t instance, std::uint32_t* batchOut = nullptr) {
+    std::vector<std::uint8_t> batch(64);
+    std::uint32_t sideband[2] = {0xAAAAAAAA, 0xAAAAAAAA};
+    AjmBatchInfo info{};
+    AjmBatchError error{};
+    std::uint32_t id = 0;
+    Require(sceAjmBatchInitialize(batch.data(), batch.size(), &info) == 0);
+    Require(sceAjmBatchJobClearContext(&info, instance, sideband) == 0);
+    Require(sceAjmBatchStart(context, &info, 0, &error, &id) == 0);
+    if (batchOut) *batchOut = id;
+    else Require(sceAjmBatchWait(context, id, 0, &error) == 0);
+    return static_cast<std::int32_t>(sideband[0]);
+}
+
+void TestContextOwnership() {
+    constexpr int invalidContext = static_cast<int>(0x80930002);
+    constexpr int invalidInstance = static_cast<int>(0x80930003);
+    constexpr int invalidBatch = static_cast<int>(0x80930004);
+    std::uint32_t first = 0;
+    std::uint32_t second = 0;
+    Require(sceAjmInitialize(0, &first) == 0 && sceAjmInitialize(0, &second) == 0 && first != second);
+    std::uint32_t inFirst = 0;
+    std::uint32_t inSecond = 0;
+    Require(sceAjmInstanceCreate(first, 0, 0, &inFirst) == 0 && sceAjmInstanceCreate(second, 0, 0, &inSecond) == 0);
+    Require(inFirst != inSecond);
+    Require(ClearResult(first, inFirst) == 0 && ClearResult(second, inSecond) == 0);
+    Require(ClearResult(second, inFirst) == 4 && ClearResult(first, inSecond) == 4);
+    Require(sceAjmInstanceDestroy(second, inFirst) == invalidInstance);
+    Require(sceAjmInstanceDestroy(first, inSecond) == invalidInstance);
+    Require(sceAjmInstanceDestroy(0xFFFF, inFirst) == invalidContext);
+    std::uint32_t unknown = 0;
+    Require(sceAjmInstanceCreate(0xFFFF, 0, 0, &unknown) == invalidContext && unknown == 0);
+
+    std::uint32_t pending = 0;
+    ClearResult(first, inFirst, &pending);
+    AjmBatchError error{};
+    Require(sceAjmBatchWait(second, pending, 0, &error) == invalidBatch);
+    Require(sceAjmBatchCancel(second, pending) == invalidBatch);
+    Require(sceAjmBatchCancel(first, pending) == 0);
+    Require(sceAjmBatchWait(0xFFFF, pending, 0, &error) == invalidContext);
+
+    std::uint32_t pendingSecond = 0;
+    ClearResult(second, inSecond, &pendingSecond);
+    Require(sceAjmFinalize(first) == 0);
+    Require(sceAjmFinalize(first) == invalidContext);
+    Require(sceAjmBatchWait(first, pending, 0, &error) == invalidContext);
+    Require(sceAjmInstanceCreate(first, 0, 0, &unknown) == invalidContext);
+    Require(sceAjmInstanceDestroy(first, inFirst) == invalidContext);
+    Require(sceAjmInstanceDestroy(second, inFirst) == invalidInstance);
+    Require(ClearResult(second, inSecond) == 0);
+    Require(sceAjmBatchWait(second, pendingSecond, 0, &error) == 0);
+    std::uint32_t again = 0;
+    Require(sceAjmInstanceCreate(second, 0, 0, &again) == 0 && again != inSecond);
+    Require(sceAjmInstanceDestroy(second, again) == 0);
+    Require(sceAjmInstanceDestroy(second, inSecond) == 0);
+    Require(sceAjmFinalize(second) == 0);
+    std::vector<std::uint8_t> batch(64);
+    AjmBatchInfo info{};
+    std::uint32_t id = 0;
+    Require(sceAjmBatchInitialize(batch.data(), batch.size(), &info) == 0);
+    Require(sceAjmBatchStart(second, &info, 0, &error, &id) == invalidContext);
+}
+
 void TestBatchCancel(std::uint32_t context) {
     constexpr int invalidContext = static_cast<int>(0x80930002);
     constexpr int invalidBatch = static_cast<int>(0x80930004);
@@ -1822,6 +2044,10 @@ int main() {
     TestBatchWaitRelease(context);
     TestInstanceHandleLifetime(context);
     TestBatchCancel(context);
+    TestMalformedBatch(context);
+    TestContextOwnership();
+    TestParallelInstances(context);
+    TestOverlappingOutputs(context);
     TestControlAt9(context);
     TestMultichannelAt9(context);
     TestControlMp3(context);

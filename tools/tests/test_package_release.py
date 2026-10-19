@@ -1,5 +1,7 @@
-import os
+import contextlib
+import io
 import json
+import os
 import ctypes
 import stat
 import subprocess
@@ -53,16 +55,19 @@ class ReleasePackageTests(unittest.TestCase):
         names = ("libgcc_s_seh-1.dll", "libstdc++-6.dll", "libwinpthread-1.dll")
         for name in names:
             (runtime / name).write_bytes(name.encode())
+        allocator = ("mimalloc.dll", "mimalloc-redirect.dll")
+        for name in allocator:
+            (self.library.parent / name).write_bytes(name.encode())
         compiler = runtime / "g++.exe"
         (self.build / "CMakeCache.txt").write_text("CMAKE_CXX_COMPILER:STRING=" + compiler.as_posix() + "\n", encoding="utf-8")
         (self.build / "core/relinker/relinker.exe").write_bytes(b"Windows executable")
         package_release.package("windows", self.build, self.output, "v1")
         with zipfile.ZipFile(self.output / "prx-windows-v1.zip") as archive:
-            self.assertEqual(set(archive.namelist()), {"libs/libc.prx", *("libs/" + name for name in names)})
-            for name in names:
+            self.assertEqual(set(archive.namelist()), {"libs/libc.prx", *("libs/" + name for name in names + allocator)})
+            for name in names + allocator:
                 self.assertEqual(archive.read("libs/" + name), name.encode())
         with tarfile.open(self.output / "prx-windows-v1.tar.gz") as archive:
-            for name in names:
+            for name in names + allocator:
                 self.assertEqual(archive.extractfile("libs/" + name).read(), name.encode())
         self.assertEqual((self.output / "relinker-v1.exe").read_bytes(), b"Windows executable")
 
@@ -91,6 +96,9 @@ class ReleasePackageTests(unittest.TestCase):
                     for runtime_name in ("libgcc_s_seh-1.dll", "libstdc++-6.dll", "libwinpthread-1.dll"):
                         (runtime / runtime_name).write_bytes(runtime_name.encode())
                         expected.add("libs/" + runtime_name)
+                    for allocator_name in ("mimalloc.dll", "mimalloc-redirect.dll"):
+                        (directory / allocator_name).write_bytes(allocator_name.encode())
+                        expected.add("libs/" + allocator_name)
                     cache += "CMAKE_CXX_COMPILER:FILEPATH=" + (runtime / "g++.exe").as_posix() + "\n"
                     (self.build / "core/relinker/relinker.exe").write_bytes(b"Windows executable")
                 (self.build / "CMakeCache.txt").write_text(cache, encoding="utf-8")
@@ -469,6 +477,71 @@ class ReleaseNotesTests(unittest.TestCase):
                 prepare_release_notes.prepare_notes(source, body, full)
                 self.assertEqual(full.read_bytes(), notes.encode("utf-8"))
                 self.assertEqual(body.read_bytes(), prepare_release_notes.release_body(notes).encode("utf-8"))
+
+
+class ReleaseNotesEdgeCaseTests(unittest.TestCase):
+    def test_non_string_body_raises_value_error(self):
+        source = json.dumps({"body": 123})
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            source_path = directory / "source.json"
+            source_path.write_text(source, encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "must be a string"):
+                prepare_release_notes.prepare_notes(source_path, directory / "body.md", directory / "full.md")
+
+    def test_main_with_valid_arguments(self):
+        notes = "# Release v1.0.0\n\n## What's Changed\n\n* Fix a by @user in #1\n"
+        source = json.dumps({"body": notes})
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            source_path = directory / "source.json"
+            body_path = directory / "body.md"
+            full_path = directory / "full.md"
+            source_path.write_text(source, encoding="utf-8")
+            arguments = [
+                "prepare_release_notes.py",
+                "--input", str(source_path),
+                "--body", str(body_path),
+                "--full", str(full_path),
+            ]
+            with contextlib.redirect_stdout(io.StringIO()):
+                with patch.object(sys, "argv", arguments):
+                    prepare_release_notes.main()
+            self.assertEqual(full_path.read_text(encoding="utf-8"), notes)
+            self.assertEqual(body_path.read_text(encoding="utf-8"), notes)
+
+    def test_main_with_missing_arguments_exits_with_error(self):
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                with patch.object(sys, "argv", ["prepare_release_notes.py"]):
+                    prepare_release_notes.main()
+
+    def test_creates_parent_directories(self):
+        notes = "# Release v1.0.0\n"
+        source = json.dumps({"body": notes})
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            source_path = directory / "source.json"
+            source_path.write_text(source, encoding="utf-8")
+            body_path = directory / "nested" / "body.md"
+            full_path = directory / "nested" / "full.md"
+            prepare_release_notes.prepare_notes(source_path, body_path, full_path)
+            self.assertEqual(full_path.read_text(encoding="utf-8"), notes)
+
+    def test_body_over_limit_without_whats_changed_is_returned_unchanged(self):
+        notes = "# Release\n\n## Details\n\n" + "x" * (prepare_release_notes.BODY_LIMIT + 1)
+        result = prepare_release_notes.release_body(notes)
+        self.assertEqual(result, notes)
+
+    def test_body_over_limit_preserves_full_changelog_link(self):
+        notes = (
+            "## What's Changed\n"
+            "* Fix a by @user in #1\n\n"
+            "**Full Changelog**: https://github.com/example/compare/v0.9.0...v1.0.0\n"
+        )
+        result = prepare_release_notes.release_body(notes + "x" * (prepare_release_notes.BODY_LIMIT + 1))
+        self.assertNotIn("What's Changed", result)
+        self.assertIn("Full Changelog", result)
 
 
 if __name__ == "__main__":

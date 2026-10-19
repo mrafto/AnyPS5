@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include <algorithm>
 #include <cstdlib>
 
 namespace AgcDriver::DriverDetail {
@@ -34,6 +35,21 @@ void Driver::reportDrawCache(DrawEntryCounters& counters, bool profile) {
         std::snprintf(line, sizeof(line), "[draw-cache] 10 s: %llu lookups, %llu hits (%.1f%%), %llu stage misses, %llu without an entry, %llu data-only hits (stages: %llu reused, %llu compiled; %llu verified); no entry: new registers %llu, user words/pointers only %llu, evicted %llu, seen but never inserted %llu; stage misses: front differing %llu, fragment differing %llu, other differing %llu, layout %llu, gate %llu, stage count %llu; differing captures: same runs %llu (%.1f words changed each), other runs %llu; %zu entries, %llu evicted\n", count(counters.lookups), count(counters.hits), counters.lookups != 0 ? 100.0 * static_cast<double>(counters.hits) / static_cast<double>(counters.lookups) : 0.0, count(misses), count(counters.absent), count(counters.dataHits), count(counters.dataStagesReused), count(counters.dataStagesCompiled), count(counters.dataVerified), count(counters.absentNewRegisters), count(counters.absentUserWords), count(counters.absentEvicted), count(counters.absentNeverInserted), miss(DrawMiss::FrontDiffering), miss(DrawMiss::FragmentDiffering), miss(DrawMiss::OtherDiffering), miss(DrawMiss::Layout), miss(DrawMiss::Gate), miss(DrawMiss::Stages), count(counters.differingSameRuns), counters.differingSameRuns != 0 ? static_cast<double>(counters.differingWords) / static_cast<double>(counters.differingSameRuns) : 0.0, count(counters.differingRunsChanged), drawCache.size(), count(counters.evictions));
         text += line;
         std::snprintf(line, sizeof(line), "[draw-cache] register-key miss component changes (10 s): stable registers %llu, user data %llu, auxiliary registers %llu, device %llu, first shader set %llu, unchanged components %llu\n", count(counters.registerKeyMissChanges[0]), count(counters.registerKeyMissChanges[1]), count(counters.registerKeyMissChanges[2]), count(counters.registerKeyMissChanges[3]), count(counters.registerKeyMissChanges[4]), count(counters.registerKeyMissChanges[5]));
+        text += line;
+        std::array<std::pair<std::uint64_t, std::uint32_t>, 8> top{};
+        for (std::uint32_t offset = 0; offset < counters.userWordChanges.size(); ++offset) {
+            const auto changes = counters.userWordChanges[offset];
+            if (changes == 0 || changes <= top.back().first) continue;
+            top.back() = {changes, offset};
+            std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+        }
+        std::string registers;
+        for (const auto& [changes, offset] : top) {
+            if (changes == 0) break;
+            std::snprintf(line, sizeof(line), " 0x%x=%llu", offset, count(changes));
+            registers += line;
+        }
+        std::snprintf(line, sizeof(line), "[draw-cache] user data words changed on a miss against the last draw of the same shader set (10 s): %llu moved by under 1 MiB (pointers into one buffer, counters), %llu moved further; by register:%s\n", count(counters.userWordNearChanges), count(counters.userWordFarChanges), registers.c_str());
         text += line;
     }
     if (profile) text += profileDrawCacheLines(counters);
