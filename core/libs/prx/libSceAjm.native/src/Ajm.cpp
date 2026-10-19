@@ -131,6 +131,7 @@ struct Resampler {
 };
 
 struct Instance {
+    std::uint32_t context = 0;
     std::uint32_t codec = 0;
     std::uint64_t flags = 0;
     void* decoder = nullptr;
@@ -179,11 +180,16 @@ struct Instance {
 
 std::mutex& g_lock = *new std::mutex();
 std::map<std::uint32_t, std::unique_ptr<Instance>>& g_instances = *new std::map<std::uint32_t, std::unique_ptr<Instance>>();
+struct Context {
+    std::set<std::uint32_t> instances;
+};
+
+std::map<std::uint32_t, Context>& g_contexts = *new std::map<std::uint32_t, Context>();
 std::atomic<std::uint32_t> g_nextContext{1};
 std::atomic<std::uint32_t> g_nextInstance{1};
 std::atomic<std::uint32_t> g_nextBatch{1};
 std::mutex& g_batchLock = *new std::mutex();
-std::set<std::uint32_t>& g_batches = *new std::set<std::uint32_t>();
+std::map<std::uint32_t, std::uint32_t>& g_batches = *new std::map<std::uint32_t, std::uint32_t>();
 
 enum class JobKind : std::uint32_t {
     Initialize = 1,
@@ -1527,7 +1533,7 @@ std::size_t HeldSamples(const Instance& instance) {
     return channels == 0 ? 0 : instance.opusPending.size() / (channels * sampleBytes);
 }
 
-void Execute(const JobHeader& job, const AjmBuffer* inputs, const AjmBuffer* outputs) {
+void Execute(std::uint32_t context, const JobHeader& job, const AjmBuffer* inputs, const AjmBuffer* outputs) {
     if (job.kind == JobKind::GetStatistics) {
         AJM_TRACE("[ajm] statistics job: sideband %llu bytes\n", static_cast<unsigned long long>(job.sidebandSize));
         if (job.sideband && job.sidebandSize) std::memset(job.sideband, 0, std::min<std::uint64_t>(job.sidebandSize, 24));
@@ -1535,7 +1541,7 @@ void Execute(const JobHeader& job, const AjmBuffer* inputs, const AjmBuffer* out
     }
     std::lock_guard lock(g_lock);
     auto* instance = Find(job.instance);
-    if (!instance) {
+    if (!instance || instance->context != context) {
         AJM_TRACE("[ajm] job kind %u on unknown instance %u\n", static_cast<unsigned>(job.kind), job.instance);
         WriteResult(job.sideband, job.sidebandSize, AJM_RESULT_INVALID_PARAMETER);
         return;
@@ -1613,6 +1619,11 @@ void Execute(const JobHeader& job, const AjmBuffer* inputs, const AjmBuffer* out
     }
 }
 
+bool ContextExists(std::uint32_t context) {
+    std::lock_guard lock(g_lock);
+    return g_contexts.contains(context);
+}
+
 }
 
 extern "C" {
@@ -1620,45 +1631,55 @@ extern "C" {
 int APS5_VABI sceAjmInitialize(int64_t reserved, uint32_t* context) {
     (void)reserved;
     if (!context) return SCE_AJM_ERROR_INVALID_PARAMETER;
-    *context = g_nextContext.fetch_add(1, std::memory_order_relaxed);
+    const auto id = g_nextContext.fetch_add(1, std::memory_order_relaxed);
+    {
+        std::lock_guard lock(g_lock);
+        g_contexts.emplace(id, Context{});
+    }
+    *context = id;
     return 0;
 }
 
 int APS5_VABI sceAjmFinalize(uint32_t context) {
-    (void)context;
+    {
+        std::lock_guard lock(g_lock);
+        const auto found = g_contexts.find(context);
+        if (found == g_contexts.end()) return SCE_AJM_ERROR_INVALID_CONTEXT;
+        for (const auto instance : found->second.instances) g_instances.erase(instance);
+        g_contexts.erase(found);
+    }
+    std::lock_guard lock(g_batchLock);
+    std::erase_if(g_batches, [context](const auto& batch) { return batch.second == context; });
     return 0;
 }
 
 int APS5_VABI sceAjmModuleRegister(uint32_t context, uint32_t codec, int64_t reserved) {
-    (void)context;
     (void)codec;
     (void)reserved;
-    return 0;
+    return ContextExists(context) ? 0 : SCE_AJM_ERROR_INVALID_CONTEXT;
 }
 
 int APS5_VABI sceAjmModuleUnregister(uint32_t context, uint32_t codec) {
-    (void)context;
     (void)codec;
-    return 0;
+    return ContextExists(context) ? 0 : SCE_AJM_ERROR_INVALID_CONTEXT;
 }
 
 int APS5_VABI sceAjmMemoryRegister(uint32_t context, void* ptr, size_t pages) {
-    (void)context;
     (void)ptr;
     (void)pages;
-    return 0;
+    return ContextExists(context) ? 0 : SCE_AJM_ERROR_INVALID_CONTEXT;
 }
 
 int APS5_VABI sceAjmMemoryUnregister(uint32_t context, void* ptr) {
-    (void)context;
     (void)ptr;
-    return 0;
+    return ContextExists(context) ? 0 : SCE_AJM_ERROR_INVALID_CONTEXT;
 }
 
 int APS5_VABI sceAjmInstanceCreate(uint32_t context, uint32_t codec, uint64_t flags, uint32_t* instance) {
-    (void)context;
     if (!instance) return SCE_AJM_ERROR_INVALID_PARAMETER;
+    if (!ContextExists(context)) return SCE_AJM_ERROR_INVALID_CONTEXT;
     auto created = std::make_unique<Instance>();
+    created->context = context;
     created->codec = codec;
     created->flags = flags;
     if (codec == CODEC_MP3) {
@@ -1667,10 +1688,13 @@ int APS5_VABI sceAjmInstanceCreate(uint32_t context, uint32_t codec, uint64_t fl
     }
     if (codec == CODEC_M4AAC) CheckAacFlags(flags);
     std::lock_guard lock(g_lock);
+    const auto owner = g_contexts.find(context);
+    if (owner == g_contexts.end()) return SCE_AJM_ERROR_INVALID_CONTEXT;
     for (std::uint32_t attempt = 0; attempt < 0x4000; ++attempt) {
         const std::uint32_t id = (codec << 14) | (g_nextInstance.fetch_add(1, std::memory_order_relaxed) & 0x3FFF);
         if (g_instances.contains(id)) continue;
         g_instances.emplace(id, std::move(created));
+        owner->second.instances.insert(id);
         *instance = id;
         AJM_TRACE("[ajm] instance create: context %u, codec %u, flags 0x%llx -> instance %u\n", context, codec, static_cast<unsigned long long>(flags), id);
         return 0;
@@ -1679,10 +1703,13 @@ int APS5_VABI sceAjmInstanceCreate(uint32_t context, uint32_t codec, uint64_t fl
 }
 
 int APS5_VABI sceAjmInstanceDestroy(uint32_t context, uint32_t instance) {
-    (void)context;
     AJM_TRACE("[ajm] instance %u destroy\n", instance);
     std::lock_guard lock(g_lock);
-    return g_instances.erase(instance) ? 0 : SCE_AJM_ERROR_INVALID_INSTANCE;
+    const auto owner = g_contexts.find(context);
+    if (owner == g_contexts.end()) return SCE_AJM_ERROR_INVALID_CONTEXT;
+    if (owner->second.instances.erase(instance) == 0) return SCE_AJM_ERROR_INVALID_INSTANCE;
+    g_instances.erase(instance);
+    return 0;
 }
 
 int APS5_VABI sceAjmDecAt9ParseConfigData(const void* config_data, AjmDecAt9ConfigDataInfo* config_info) {
@@ -1812,41 +1839,44 @@ int APS5_VABI sceAjmBatchJobGetStatistics(AjmBatchInfo* info, float interval, vo
 }
 
 int APS5_VABI sceAjmBatchStart(uint32_t context, const AjmBatchInfo* info, int priority, AjmBatchError* error, uint32_t* batch) {
-    (void)context;
     (void)priority;
     if (!info || !batch) return SCE_AJM_ERROR_INVALID_PARAMETER;
+    if (!ContextExists(context)) return SCE_AJM_ERROR_INVALID_CONTEXT;
     AJM_TRACE("[ajm] batch start: context %u, priority %d, %llu of %llu buffer bytes used\n", context, priority, static_cast<unsigned long long>(info->offset), static_cast<unsigned long long>(info->size));
     std::vector<ParsedJob> jobs;
     if (const int status = ParseBatch(*info, jobs); status != 0) {
         AJM_TRACE("[ajm] batch start: malformed batch rejected with 0x%x\n", static_cast<unsigned>(status));
         return status;
     }
-    for (auto& parsed : jobs) Execute(parsed.job, parsed.buffers.data(), parsed.buffers.data() + parsed.job.inputCount);
+    for (auto& parsed : jobs) Execute(context, parsed.job, parsed.buffers.data(), parsed.buffers.data() + parsed.job.inputCount);
     if (error) std::memset(error, 0, sizeof(*error));
     const auto id = g_nextBatch.fetch_add(1, std::memory_order_relaxed);
     {
         std::lock_guard lock(g_batchLock);
-        g_batches.insert(id);
+        g_batches.emplace(id, context);
     }
     *batch = id;
     return 0;
 }
 
 int APS5_VABI sceAjmBatchWait(uint32_t context, uint32_t batch, uint32_t timeout, AjmBatchError* error) {
-    (void)context;
     (void)timeout;
+    if (!ContextExists(context)) return SCE_AJM_ERROR_INVALID_CONTEXT;
     {
         std::lock_guard lock(g_batchLock);
-        if (g_batches.erase(batch) == 0) return SCE_AJM_ERROR_INVALID_BATCH;
+        const auto found = g_batches.find(batch);
+        if (found == g_batches.end() || found->second != context) return SCE_AJM_ERROR_INVALID_BATCH;
+        g_batches.erase(found);
     }
     if (error) std::memset(error, 0, sizeof(*error));
     return 0;
 }
 
 int APS5_VABI sceAjmBatchCancel(uint32_t context, uint32_t batch) {
-    if (context == 0 || context >= g_nextContext.load(std::memory_order_relaxed)) return SCE_AJM_ERROR_INVALID_CONTEXT;
+    if (!ContextExists(context)) return SCE_AJM_ERROR_INVALID_CONTEXT;
     std::lock_guard lock(g_batchLock);
-    return g_batches.contains(batch) ? 0 : SCE_AJM_ERROR_INVALID_BATCH;
+    const auto found = g_batches.find(batch);
+    return found != g_batches.end() && found->second == context ? 0 : SCE_AJM_ERROR_INVALID_BATCH;
 }
 
 int APS5_VABI sceAjmBatchErrorDump(const AjmBatchInfo* info, AjmBatchError* error) {

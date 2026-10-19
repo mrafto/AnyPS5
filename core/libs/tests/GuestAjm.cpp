@@ -901,6 +901,69 @@ void TestMalformedBatch(std::uint32_t context) {
     Require(sceAjmInstanceDestroy(context, instance) == 0);
 }
 
+std::int32_t ClearResult(std::uint32_t context, std::uint32_t instance, std::uint32_t* batchOut = nullptr) {
+    std::vector<std::uint8_t> batch(64);
+    std::uint32_t sideband[2] = {0xAAAAAAAA, 0xAAAAAAAA};
+    AjmBatchInfo info{};
+    AjmBatchError error{};
+    std::uint32_t id = 0;
+    Require(sceAjmBatchInitialize(batch.data(), batch.size(), &info) == 0);
+    Require(sceAjmBatchJobClearContext(&info, instance, sideband) == 0);
+    Require(sceAjmBatchStart(context, &info, 0, &error, &id) == 0);
+    if (batchOut) *batchOut = id;
+    else Require(sceAjmBatchWait(context, id, 0, &error) == 0);
+    return static_cast<std::int32_t>(sideband[0]);
+}
+
+void TestContextOwnership() {
+    constexpr int invalidContext = static_cast<int>(0x80930002);
+    constexpr int invalidInstance = static_cast<int>(0x80930003);
+    constexpr int invalidBatch = static_cast<int>(0x80930004);
+    std::uint32_t first = 0;
+    std::uint32_t second = 0;
+    Require(sceAjmInitialize(0, &first) == 0 && sceAjmInitialize(0, &second) == 0 && first != second);
+    std::uint32_t inFirst = 0;
+    std::uint32_t inSecond = 0;
+    Require(sceAjmInstanceCreate(first, 0, 0, &inFirst) == 0 && sceAjmInstanceCreate(second, 0, 0, &inSecond) == 0);
+    Require(inFirst != inSecond);
+    Require(ClearResult(first, inFirst) == 0 && ClearResult(second, inSecond) == 0);
+    Require(ClearResult(second, inFirst) == 4 && ClearResult(first, inSecond) == 4);
+    Require(sceAjmInstanceDestroy(second, inFirst) == invalidInstance);
+    Require(sceAjmInstanceDestroy(first, inSecond) == invalidInstance);
+    Require(sceAjmInstanceDestroy(0xFFFF, inFirst) == invalidContext);
+    std::uint32_t unknown = 0;
+    Require(sceAjmInstanceCreate(0xFFFF, 0, 0, &unknown) == invalidContext && unknown == 0);
+
+    std::uint32_t pending = 0;
+    ClearResult(first, inFirst, &pending);
+    AjmBatchError error{};
+    Require(sceAjmBatchWait(second, pending, 0, &error) == invalidBatch);
+    Require(sceAjmBatchCancel(second, pending) == invalidBatch);
+    Require(sceAjmBatchCancel(first, pending) == 0);
+    Require(sceAjmBatchWait(0xFFFF, pending, 0, &error) == invalidContext);
+
+    std::uint32_t pendingSecond = 0;
+    ClearResult(second, inSecond, &pendingSecond);
+    Require(sceAjmFinalize(first) == 0);
+    Require(sceAjmFinalize(first) == invalidContext);
+    Require(sceAjmBatchWait(first, pending, 0, &error) == invalidContext);
+    Require(sceAjmInstanceCreate(first, 0, 0, &unknown) == invalidContext);
+    Require(sceAjmInstanceDestroy(first, inFirst) == invalidContext);
+    Require(sceAjmInstanceDestroy(second, inFirst) == invalidInstance);
+    Require(ClearResult(second, inSecond) == 0);
+    Require(sceAjmBatchWait(second, pendingSecond, 0, &error) == 0);
+    std::uint32_t again = 0;
+    Require(sceAjmInstanceCreate(second, 0, 0, &again) == 0 && again != inSecond);
+    Require(sceAjmInstanceDestroy(second, again) == 0);
+    Require(sceAjmInstanceDestroy(second, inSecond) == 0);
+    Require(sceAjmFinalize(second) == 0);
+    std::vector<std::uint8_t> batch(64);
+    AjmBatchInfo info{};
+    std::uint32_t id = 0;
+    Require(sceAjmBatchInitialize(batch.data(), batch.size(), &info) == 0);
+    Require(sceAjmBatchStart(second, &info, 0, &error, &id) == invalidContext);
+}
+
 void TestBatchCancel(std::uint32_t context) {
     constexpr int invalidContext = static_cast<int>(0x80930002);
     constexpr int invalidBatch = static_cast<int>(0x80930004);
@@ -1910,6 +1973,7 @@ int main() {
     TestInstanceHandleLifetime(context);
     TestBatchCancel(context);
     TestMalformedBatch(context);
+    TestContextOwnership();
     TestControlAt9(context);
     TestMultichannelAt9(context);
     TestControlMp3(context);
