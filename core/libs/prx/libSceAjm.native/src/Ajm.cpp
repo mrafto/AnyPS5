@@ -243,6 +243,51 @@ int Append(AjmBatchInfo* info, const JobHeader& header, const AjmBuffer* inputs,
     return 0;
 }
 
+struct ParsedJob {
+    JobHeader job;
+    std::vector<AjmBuffer> buffers;
+};
+
+constexpr std::size_t MAX_BATCH_JOBS = 0x10000;
+
+int ParseBatch(const AjmBatchInfo& info, std::vector<ParsedJob>& jobs) {
+    if (info.offset > info.size) return SCE_AJM_ERROR_INVALID_PARAMETER;
+    if (info.offset == 0) return 0;
+    if (!info.p_buffer) return SCE_AJM_ERROR_INVALID_PARAMETER;
+    const auto* base = static_cast<const std::uint8_t*>(info.p_buffer);
+    const std::size_t total = static_cast<std::size_t>(info.offset);
+    std::size_t position = 0;
+    while (position < total) {
+        const std::size_t remaining = total - position;
+        if (remaining < sizeof(PackedJob) || jobs.size() >= MAX_BATCH_JOBS) return SCE_AJM_ERROR_INVALID_PARAMETER;
+        PackedJob record;
+        std::memcpy(&record, base + position, sizeof(record));
+        if (record.parameterSize > sizeof(JobHeader::parameters)) return SCE_AJM_ERROR_INVALID_PARAMETER;
+        const std::size_t bufferCount = static_cast<std::size_t>(record.inputCount) + record.outputCount;
+        const std::size_t descriptorBytes = bufferCount * sizeof(AjmBuffer);
+        const std::size_t parameterBytes = (static_cast<std::size_t>(record.parameterSize) + 7u) & ~std::size_t{7};
+        if (descriptorBytes > remaining - sizeof(PackedJob) || parameterBytes > remaining - sizeof(PackedJob) - descriptorBytes) return SCE_AJM_ERROR_INVALID_PARAMETER;
+        const std::size_t required = sizeof(PackedJob) + descriptorBytes + parameterBytes;
+        if (record.bytes == 0 || record.bytes < required || record.bytes > remaining) return SCE_AJM_ERROR_INVALID_PARAMETER;
+        ParsedJob parsed{};
+        parsed.job.kind = static_cast<JobKind>(record.kind);
+        parsed.job.bytes = record.bytes;
+        parsed.job.instance = record.instance;
+        parsed.job.flags = record.flags;
+        parsed.job.sideband = record.sideband;
+        parsed.job.sidebandSize = record.sidebandSize;
+        parsed.job.inputCount = record.inputCount;
+        parsed.job.outputCount = record.outputCount;
+        parsed.job.parameterSize = record.parameterSize;
+        parsed.buffers.resize(bufferCount);
+        if (bufferCount) std::memcpy(parsed.buffers.data(), base + position + sizeof(PackedJob), descriptorBytes);
+        if (record.parameterSize) std::memcpy(parsed.job.parameters, base + position + sizeof(PackedJob) + descriptorBytes, record.parameterSize);
+        jobs.push_back(std::move(parsed));
+        position += record.bytes;
+    }
+    return 0;
+}
+
 JobHeader MakeHeader(JobKind kind, std::uint32_t instance, void* sideband, std::uint64_t sidebandSize) {
     JobHeader header{};
     header.kind = kind;
@@ -1771,28 +1816,12 @@ int APS5_VABI sceAjmBatchStart(uint32_t context, const AjmBatchInfo* info, int p
     (void)priority;
     if (!info || !batch) return SCE_AJM_ERROR_INVALID_PARAMETER;
     AJM_TRACE("[ajm] batch start: context %u, priority %d, %llu of %llu buffer bytes used\n", context, priority, static_cast<unsigned long long>(info->offset), static_cast<unsigned long long>(info->size));
-    const auto* cursor = static_cast<const std::uint8_t*>(info->p_buffer);
-    const auto* end = cursor + info->offset;
-    std::vector<AjmBuffer> buffers;
-    while (cursor < end) {
-        PackedJob record;
-        std::memcpy(&record, cursor, sizeof(record));
-        JobHeader job{};
-        job.kind = static_cast<JobKind>(record.kind);
-        job.bytes = record.bytes;
-        job.instance = record.instance;
-        job.flags = record.flags;
-        job.sideband = record.sideband;
-        job.sidebandSize = record.sidebandSize;
-        job.inputCount = record.inputCount;
-        job.outputCount = record.outputCount;
-        job.parameterSize = record.parameterSize;
-        buffers.resize(record.inputCount + record.outputCount);
-        if (!buffers.empty()) std::memcpy(buffers.data(), cursor + sizeof(record), buffers.size() * sizeof(AjmBuffer));
-        if (record.parameterSize) std::memcpy(job.parameters, cursor + sizeof(record) + buffers.size() * sizeof(AjmBuffer), record.parameterSize);
-        Execute(job, buffers.data(), buffers.data() + job.inputCount);
-        cursor += record.bytes;
+    std::vector<ParsedJob> jobs;
+    if (const int status = ParseBatch(*info, jobs); status != 0) {
+        AJM_TRACE("[ajm] batch start: malformed batch rejected with 0x%x\n", static_cast<unsigned>(status));
+        return status;
     }
+    for (auto& parsed : jobs) Execute(parsed.job, parsed.buffers.data(), parsed.buffers.data() + parsed.job.inputCount);
     if (error) std::memset(error, 0, sizeof(*error));
     const auto id = g_nextBatch.fetch_add(1, std::memory_order_relaxed);
     {

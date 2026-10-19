@@ -814,6 +814,93 @@ void TestBatchWaitRelease(std::uint32_t context) {
     Require(sceAjmBatchWait(context, second + 1, 0, &error) == invalidBatch);
 }
 
+void TestMalformedBatch(std::uint32_t context) {
+    constexpr int invalidParameter = static_cast<int>(0x80930005);
+    constexpr std::size_t headerBytes = 32;
+    std::uint32_t instance = 0;
+    Require(sceAjmInstanceCreate(context, 0, 0, &instance) == 0);
+    std::vector<std::uint8_t> batch(256);
+    std::vector<std::uint8_t> first(8, 0xAA);
+    std::vector<std::uint8_t> second(8, 0xAA);
+    AjmBatchInfo info{};
+    AjmBatchError error{};
+    std::uint32_t id = 0;
+    const auto build = [&](bool withBuffers) {
+        std::fill(first.begin(), first.end(), std::uint8_t{0xAA});
+        std::fill(second.begin(), second.end(), std::uint8_t{0xAA});
+        Require(sceAjmBatchInitialize(batch.data(), batch.size(), &info) == 0);
+        Require(sceAjmBatchJobClearContext(&info, instance, first.data()) == 0);
+        const std::size_t secondStart = static_cast<std::size_t>(info.offset);
+        if (withBuffers) {
+            std::uint8_t in[4] = {};
+            std::uint8_t out[4] = {};
+            Require(sceAjmBatchJobRun(&info, instance, 0, in, sizeof(in), out, sizeof(out), second.data(), second.size()) == 0);
+        } else {
+            Require(sceAjmBatchJobClearContext(&info, instance, second.data()) == 0);
+        }
+        return secondStart;
+    };
+    const auto rejected = [&](const AjmBatchInfo& candidate) {
+        const bool refused = sceAjmBatchStart(context, &candidate, 0, &error, &id) == invalidParameter;
+        for (const auto byte : first) Require(byte == 0xAA);
+        for (const auto byte : second) Require(byte == 0xAA);
+        return refused;
+    };
+
+    build(false);
+    Submit(context, info);
+    Require(first[0] == 0 && second[0] == 0);
+
+    std::size_t start = build(false);
+    AjmBatchInfo truncated = info;
+    truncated.offset = start + headerBytes - 1;
+    Require(rejected(truncated));
+
+    start = build(false);
+    AjmBatchInfo past = info;
+    past.offset = info.size + 1;
+    Require(rejected(past));
+
+    start = build(false);
+    batch[start + 3] = 17;
+    Require(rejected(info));
+
+    start = build(true);
+    AjmBatchInfo shortDescriptors = info;
+    shortDescriptors.offset = start + headerBytes + sizeof(AjmBuffer);
+    Require(rejected(shortDescriptors));
+
+    start = build(false);
+    std::uint32_t zero = 0;
+    std::memcpy(batch.data() + start + 28, &zero, sizeof(zero));
+    Require(rejected(info));
+
+    start = build(false);
+    std::uint32_t small = headerBytes - 1;
+    std::memcpy(batch.data() + start + 28, &small, sizeof(small));
+    Require(rejected(info));
+
+    start = build(false);
+    std::uint32_t huge = 0x7FFFFFFF;
+    std::memcpy(batch.data() + start + 28, &huge, sizeof(huge));
+    Require(rejected(info));
+
+    start = build(true);
+    batch[start + 1] = 0xFF;
+    batch[start + 2] = 0xFF;
+    Require(rejected(info));
+
+    AjmBatchInfo nullBuffer{};
+    nullBuffer.p_buffer = nullptr;
+    nullBuffer.offset = headerBytes;
+    nullBuffer.size = headerBytes;
+    Require(rejected(nullBuffer));
+
+    build(false);
+    Require(sceAjmBatchStart(context, &info, 0, &error, &id) == 0 && sceAjmBatchWait(context, id, 0, &error) == 0);
+    Require(sceAjmInstanceDestroy(context, instance) == 0);
+}
+
 void TestBatchCancel(std::uint32_t context) {
     constexpr int invalidContext = static_cast<int>(0x80930002);
     constexpr int invalidBatch = static_cast<int>(0x80930004);
@@ -1822,6 +1909,7 @@ int main() {
     TestBatchWaitRelease(context);
     TestInstanceHandleLifetime(context);
     TestBatchCancel(context);
+    TestMalformedBatch(context);
     TestControlAt9(context);
     TestMultichannelAt9(context);
     TestControlMp3(context);
