@@ -120,12 +120,6 @@ void WaitIdle(std::unique_lock<std::mutex>& lock, std::int32_t id) {
 
 void ReleaseId(std::int32_t id) {
     std::unique_lock<std::mutex> lock(g_mutex);
-    const auto queued = std::find_if(g_queue.begin(), g_queue.end(), [id](const Job& job) { return job.id == id; });
-    if (queued != g_queue.end()) {
-        g_queue.erase(queued);
-        g_phases[id] = Phase::Idle;
-        g_states[id] = AioAborted;
-    }
     WaitIdle(lock, id);
     g_occupied[id] = false;
     g_states[id] = AioAborted;

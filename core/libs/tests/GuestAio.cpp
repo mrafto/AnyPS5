@@ -245,6 +245,31 @@ static void CheckAsynchronous(const std::filesystem::path& root) {
     deleter.join();
     Check(deleted && heldResult.state == 3 && heldResult.return_value == 4);
 
+    CloseGate({firstFd});
+    KernelAioResult blockerResult{-1, 0};
+    KernelAioResult waitingResult{-1, 0};
+    std::array<char, 4> blockerBuffer{};
+    std::array<char, 4> waitingBuffer{};
+    KernelAioRwRequest blocker{0, blockerBuffer.size(), blockerBuffer.data(), &blockerResult, firstFd};
+    KernelAioRwRequest waiting{4, waitingBuffer.size(), waitingBuffer.data(), &waitingResult, firstFd};
+    std::int32_t blockerId = 0;
+    std::int32_t waitingId = 0;
+    Check(sceKernelAioSubmitReadCommands(&blocker, 1, 0, &blockerId) == 0);
+    Check(WaitInside(1));
+    Check(sceKernelAioSubmitReadCommands(&waiting, 1, 0, &waitingId) == 0);
+    std::atomic<bool> waitingDeleted{false};
+    std::thread queuedDeleter([&] {
+        std::int32_t ret = -1;
+        Check(sceKernelAioDeleteRequest(waitingId, &ret) == 0 && ret == 0);
+        waitingDeleted = true;
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    Check(!waitingDeleted);
+    OpenGate();
+    queuedDeleter.join();
+    Check(waitingResult.state == 3 && waitingResult.return_value == 4 && blockerResult.state == 3);
+    Check(sceKernelAioDeleteRequest(blockerId, &removed) == 0);
+
     CloseGate({secondFd});
     KernelAioResult closeResult{-1, 0};
     std::array<char, 4> closeBuffer{};
