@@ -102,6 +102,7 @@ The code reads environment names through `getenv`, `IsEnvironmentSet`, `kibSetti
 | `APS5_COUNT_ALL_COMPLETION_LABELS` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/Recorder.cpp` |  | counts a completion label also stored on the GPU as pending from its registration |
 | `APS5_CPU_COPIES` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/GuestBufferMemory.cpp` |  | copies misaligned descriptor sub-ranges on the CPU instead of with a GPU buffer copy |
 | `APS5_CPU_DCC_KEYS` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/DccMetadata.cpp` |  | always stores DCC keys on the CPU |
+| `APS5_CPU_FLIP_IN_ORDER` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/Driver/Queues/Submission.cpp` |  | holds a flip thread's CPU flips behind work already queued on queue 0 instead of submitting them ahead of it |
 | `APS5_CPU_STORES` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/Driver/Packets/PacketMemory.cpp` |  | writes packet stores on the CPU instead of recording them on the GPU |
 | `APS5_DCC_KEYS_EACH` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/Recorder.cpp` |  | records every DCC key store at once instead of batching them |
 | `APS5_DEPTH_COPY_MIN_KIB` | integer | `core/libs/prx/libSceAgcDriver/Graphics/src/ShaderResources.cpp` | 1024 | minimum surface size in KiB for a depth target to take the depth-copy path |
