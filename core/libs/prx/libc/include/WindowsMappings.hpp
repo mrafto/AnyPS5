@@ -556,12 +556,19 @@ private:
 
     void collectResident(std::uintptr_t start, Run& run, std::uintptr_t from, std::uintptr_t stop, void** pages, std::size_t* count, bool clear, Collection collection) {
         const auto first = from & ~std::uintptr_t{4095};
+        if (run.fresh == 0 && collection == Collection::Fresh) return;
         std::vector<std::uintptr_t> written;
         if (collection != Collection::Fresh) {
-            std::vector<void*> found((stop - first + 4095) / 4096);
+            thread_local std::vector<void*> found;
+            found.resize((stop - first + 4095) / 4096);
             ULONG_PTR reported = found.size();
             DWORD granularity = 0;
             if (GetWriteWatch(clear ? WRITE_WATCH_FLAG_RESET : 0, reinterpret_cast<void*>(first), stop - first, found.data(), &reported, &granularity) != 0) fail("collect resident guest writes");
+            if (run.fresh == 0) {
+                for (ULONG_PTR index = 0; index < reported; ++index) pages[(*count)++] = reinterpret_cast<void*>(std::max(reinterpret_cast<std::uintptr_t>(found[index]), from));
+                return;
+            }
+            written.reserve(reported);
             for (ULONG_PTR index = 0; index < reported; ++index) written.push_back(reinterpret_cast<std::uintptr_t>(found[index]));
         }
         auto next = written.begin();
