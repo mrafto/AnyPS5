@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "SceTypes.hpp"
+#include "prx/libc/include/CpuTopology.hpp"
 #include "prx/libc/include/General.hpp"
 
 extern "C" {
@@ -21,6 +22,7 @@ int APS5_VABI scePthreadAttrSetinheritsched(PthreadAttr* attr, int inheritSched)
 int APS5_VABI scePthreadAttrSetschedparam(PthreadAttr* attr, const KernelSchedParam* param);
 int APS5_VABI scePthreadAttrSetstacksize(PthreadAttr* attr, std::size_t stackSize);
 int APS5_VABI scePthreadAttrSetaffinity(PthreadAttr* attr, KernelCpumask mask);
+int APS5_VABI Aps5PthreadAttrSetSchedulingRole_nid_no_patch(PthreadAttr* attr, std::uint32_t role);
 int APS5_VABI scePthreadCreate(Pthread* thread, const PthreadAttr* attr, PthreadEntry entry, void* arg, const char* name);
 int APS5_VABI scePthreadJoin(Pthread thread, void** result);
 int APS5_VABI sceKernelCreateEqueue(KernelEqueue* eq, const char* name);
@@ -58,6 +60,7 @@ constexpr int SequenceLimitExceeded = static_cast<int>(0x81580003u);
 constexpr int SequenceNoneFree = static_cast<int>(0x81580006u);
 constexpr int SequenceInvalid = static_cast<int>(0x81580007u);
 
+constexpr std::uint32_t JobWorkerRole = static_cast<std::uint32_t>(CpuTopology::ThreadRole::JobWorker);
 constexpr std::uint32_t MaxWorkers = 13;
 constexpr std::uint32_t MaxSequences = 32;
 constexpr std::uint32_t MaxInvocations = 0x7fff;
@@ -594,7 +597,8 @@ void StartWorkers(Manager& manager, const ConfigParams& config, std::uint32_t wo
         PthreadAttr attributes = nullptr;
         if (scePthreadAttrInit(&attributes) != 0) throw std::runtime_error("libSceJobManager: scePthreadAttrInit failed");
         if (scePthreadAttrSetinheritsched(&attributes, 0) != 0 || scePthreadAttrSetschedparam(&attributes, &schedule) != 0 ||
-            scePthreadAttrSetstacksize(&attributes, config.stackSize) != 0 || scePthreadAttrSetaffinity(&attributes, affinity) != 0) {
+            scePthreadAttrSetstacksize(&attributes, config.stackSize) != 0 || scePthreadAttrSetaffinity(&attributes, affinity) != 0 ||
+            Aps5PthreadAttrSetSchedulingRole_nid_no_patch(&attributes, JobWorkerRole) != 0) {
             throw std::runtime_error("libSceJobManager: a worker thread attribute was rejected");
         }
         Pthread thread = nullptr;

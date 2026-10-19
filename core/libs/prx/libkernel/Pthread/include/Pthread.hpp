@@ -106,6 +106,7 @@ struct PthreadAttrPrivate {
     std::size_t _guardsize = 0x1000;
     int _solosched = 0;
     int _scope = GUEST_SCOPE_SYSTEM;
+    std::uint32_t _schedulingRole = 0;
 };
 
 inline std::atomic<std::int64_t> nextThreadId{100000};
@@ -129,6 +130,7 @@ struct PthreadPrivate {
     std::atomic<KernelCpumask> affinity{DEFAULT_THREAD_AFFINITY};
     std::atomic<int> priority{DEFAULT_THREAD_PRIORITY};
     int scope = GUEST_SCOPE_SYSTEM;
+    std::uint32_t schedulingRole = 0;
     int cpuClockThread = 0;
 #ifndef _WIN32
     clockid_t hostCpuClock{};

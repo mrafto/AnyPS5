@@ -1,6 +1,7 @@
 #ifndef CORE_LIBS_PRX_LIBC_INCLUDE_CPUTOPOLOGY_HPP
 #define CORE_LIBS_PRX_LIBC_INCLUDE_CPUTOPOLOGY_HPP
 
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -21,12 +22,65 @@
 // a mask is given explicitly. Header-only so libkernel and the AGC driver share it without a link.
 namespace CpuTopology {
 
+enum class ThreadRole : std::uint32_t {
+    Default = 0,
+    JobWorker = 1,
+};
+
+inline bool ValidRole(std::uint32_t role) {
+    return role == static_cast<std::uint32_t>(ThreadRole::Default) || role == static_cast<std::uint32_t>(ThreadRole::JobWorker);
+}
+
 struct Layout {
     std::uint64_t process = 0;
     std::uint64_t efficient = 0;
     std::uint64_t performant = 0;
+    std::uint16_t group = 0;
     bool hybrid = false;
 };
+
+struct Core {
+    std::uint16_t group;
+    std::uint64_t mask;
+    unsigned efficiencyClass;
+};
+
+inline Layout Classify(const Core* cores, std::size_t count, std::uint64_t process) {
+    Layout result{};
+    result.process = process;
+    constexpr unsigned classes = 256;
+    int lowest = -1;
+    int highest = -1;
+    for (std::size_t index = 0; index < count; ++index) {
+        if (cores[index].efficiencyClass >= classes || cores[index].mask == 0) continue;
+        const int cls = static_cast<int>(cores[index].efficiencyClass);
+        if (lowest < 0 || cls < lowest) lowest = cls;
+        if (cls > highest) highest = cls;
+    }
+    if (lowest < 0 || lowest == highest) return result;
+    std::uint64_t efficient = 0;
+    std::uint64_t performant = 0;
+    std::uint16_t group = 0;
+    bool grouped = false;
+    for (std::size_t index = 0; index < count; ++index) {
+        const int cls = static_cast<int>(cores[index].efficiencyClass);
+        if (cores[index].efficiencyClass >= classes || cores[index].mask == 0 || (cls != lowest && cls != highest)) continue;
+        if (grouped && cores[index].group != group) return result;
+        group = cores[index].group;
+        grouped = true;
+        (cls == lowest ? efficient : performant) |= cores[index].mask;
+    }
+    if (efficient == 0 || performant == 0) return result;
+    result.efficient = efficient;
+    result.performant = performant;
+    result.group = group;
+    result.hybrid = true;
+    return result;
+}
+
+inline std::uint64_t ClipToProcess(const Layout& layout, std::uint64_t mask) {
+    return layout.group == 0 && layout.process != 0 ? mask & layout.process : mask;
+}
 
 #ifdef __linux__
 inline std::uint64_t MaskFromCpuList(const char* path) {
@@ -66,29 +120,18 @@ inline const Layout& Get() {
         if (GetLastError() != ERROR_INSUFFICIENT_BUFFER || length == 0) return result;
         std::vector<unsigned char> buffer(length);
         if (!GetLogicalProcessorInformationEx(RelationProcessorCore, reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buffer.data()), &length)) return result;
-        std::uint64_t byClass[256] = {};
-        bool seen[256] = {};
+        std::vector<Core> cores;
         for (DWORD offset = 0; offset + 8 <= length;) {
             const auto* entry = reinterpret_cast<const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buffer.data() + offset);
             if (entry->Size == 0 || offset + entry->Size > length) break;
-            if (entry->Relationship == RelationProcessorCore && entry->Processor.GroupCount >= 1 && entry->Processor.GroupMask[0].Group == 0) {
-                const unsigned cls = entry->Processor.EfficiencyClass;
-                byClass[cls] |= static_cast<std::uint64_t>(entry->Processor.GroupMask[0].Mask);
-                seen[cls] = true;
+            if (entry->Relationship == RelationProcessorCore) {
+                for (WORD index = 0; index < entry->Processor.GroupCount; ++index) {
+                    cores.push_back({entry->Processor.GroupMask[index].Group, static_cast<std::uint64_t>(entry->Processor.GroupMask[index].Mask), entry->Processor.EfficiencyClass});
+                }
             }
             offset += entry->Size;
         }
-        int lowest = -1;
-        int highest = -1;
-        for (int cls = 0; cls < 256; ++cls) {
-            if (!seen[cls]) continue;
-            if (lowest < 0) lowest = cls;
-            highest = cls;
-        }
-        if (lowest < 0 || lowest == highest) return result;
-        result.efficient = byClass[lowest];
-        result.performant = byClass[highest];
-        result.hybrid = result.efficient != 0 && result.performant != 0;
+        result = Classify(cores.data(), cores.size(), result.process);
 #elif defined(__linux__)
         cpu_set_t set;
         CPU_ZERO(&set);
@@ -133,13 +176,15 @@ inline unsigned long ThreadId(void* handle) {
 inline std::uint64_t Pin(void* handle, std::uint64_t mask) {
 #ifdef _WIN32
     const auto& layout = Get();
-    if (layout.process != 0) mask &= layout.process;
+    mask = ClipToProcess(layout, mask);
     if (mask == 0) return 0;
     HANDLE thread = handle != nullptr ? static_cast<HANDLE>(handle) : GetCurrentThread();
-    return SetThreadAffinityMask(thread, static_cast<DWORD_PTR>(mask)) != 0 ? mask : 0;
+    GROUP_AFFINITY affinity{};
+    affinity.Mask = static_cast<KAFFINITY>(mask);
+    affinity.Group = layout.group;
+    return SetThreadGroupAffinity(thread, &affinity, nullptr) != 0 ? mask : 0;
 #elif defined(__linux__)
-    const auto& layout = Get();
-    if (layout.process != 0) mask &= layout.process;
+    mask = ClipToProcess(Get(), mask);
     if (mask == 0 || handle != nullptr) return 0;
     cpu_set_t set;
     CPU_ZERO(&set);

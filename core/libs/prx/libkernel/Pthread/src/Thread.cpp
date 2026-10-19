@@ -382,6 +382,7 @@ PthreadPrivate::PthreadPrivate(const PthreadAttrPrivate* attr) : _finished(false
     std::lock_guard lock(registry.lock);
     const auto* parent = CurrentGuestState().current;
     const KernelCpumask inherited = parent ? parent->affinity.load(std::memory_order_relaxed) : registry.processAffinity;
+    schedulingRole = attr ? attr->_schedulingRole : 0;
     affinity.store(attr && attr->_affinityExplicit ? attr->_affinity : inherited, std::memory_order_relaxed);
     constexpr int ExplicitSched = 0;
     const bool explicitSched = attr && attr->_inheritsched == ExplicitSched;
@@ -699,12 +700,6 @@ static void RecycleJoinedThread(Pthread* storage) {
 }
 
 #ifdef _WIN32
-// The title's job workers ("BPE JobWorkerThread CPU0".."CPU12") spin at full load on one core each.
-// Pinning them to the efficiency cores of a hybrid CPU (APS5_JOB_AFFINITY=1, with the driver's
-// worker pinning) measured 0 to -9 % at the video stage, so the default leaves them free;
-// APS5_JOB_AFFINITY_MASK=<hex> picks the cores.
-static constexpr const char* JOB_WORKER_PREFIX = "BPE JobWorkerThread";
-
 static std::uint64_t JobWorkerMask() {
     static const std::uint64_t mask = [] {
         if (std::getenv("APS5_NO_JOB_AFFINITY") != nullptr) return std::uint64_t{0};
@@ -718,7 +713,7 @@ static std::uint64_t JobWorkerMask() {
 }
 
 static void ApplyJobAffinity(PthreadPrivate& thread, void* handle) {
-    if (thread.name.compare(0, std::strlen(JOB_WORKER_PREFIX), JOB_WORKER_PREFIX) != 0) return;
+    if (thread.schedulingRole != static_cast<std::uint32_t>(CpuTopology::ThreadRole::JobWorker)) return;
     const auto mask = JobWorkerMask();
     if (mask == 0) return;
     static std::once_flag summary;
@@ -754,8 +749,8 @@ static unsigned __stdcall StartNativeThread(void* opaque) {
         if (!self->name.empty()) {
             const std::wstring description(self->name.begin(), self->name.end());
             SetThreadDescription(GetCurrentThread(), description.c_str());
-            ApplyJobAffinity(*self, nullptr);
         }
+        ApplyJobAffinity(*self, nullptr);
         args->initialized.set_value();
     } catch (...) {
         args->initialized.set_exception(std::current_exception());
@@ -1101,7 +1096,6 @@ int APS5_VABI scePthreadRename(Pthread thread, const char* name) {
 #ifdef _WIN32
     const std::wstring description(thread->name.begin(), thread->name.end());
     SetThreadDescription(static_cast<HANDLE>(thread->nativeHandle), description.c_str());
-    ApplyJobAffinity(*thread, thread->nativeHandle);
 #endif
     return SCE_OK;
 }
