@@ -1,17 +1,23 @@
+#include <algorithm>
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <vector>
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/GuestArena.hpp"
-#include "prx/libc/include/PreciseWait.hpp"
 #include "prx/libkernel/File/include/ArchivedFile.hpp"
 #include "prx/libkernel/File/include/File.hpp"
+#include "prx/libkernel/Aio/include/Aio.hpp"
 #include "prx/libkernel/File/include/SharedMemory.hpp"
 #include "prx/libkernel/KernelErrors.hpp"
 
@@ -35,10 +41,26 @@ constexpr std::int32_t AioDelayedCountMax = 128;
 constexpr std::uint32_t AioSplitSizeMax = 0x1000000;
 constexpr std::uint32_t AioSplitChunkSizeMax = 0x1000000;
 
+enum class Phase { Idle, Queued, Running };
+
+struct Job {
+    std::int32_t id;
+    bool write;
+    std::vector<KernelAioRwRequest> requests;
+    std::vector<std::int32_t> descriptors;
+};
+
 std::mutex g_mutex;
+std::condition_variable g_workAvailable;
+std::condition_variable g_changed;
 std::array<std::int32_t, AioMaxQueues> g_states{};
 std::array<bool, AioMaxQueues> g_occupied{};
+std::array<Phase, AioMaxQueues> g_phases{};
+std::deque<Job> g_queue;
+std::vector<std::int32_t> g_activeDescriptors;
 std::int32_t g_nextId = 1;
+std::size_t g_workers = 0;
+std::atomic<Aio::TransferGate> g_gate{nullptr};
 
 bool ValidId(std::int32_t id) {
     return id > 0 && id < AioMaxQueues;
@@ -56,6 +78,7 @@ bool AllocateIds(std::int32_t count, std::int32_t* ids) {
     for (std::int32_t i = 0; i < count; ++i) {
         g_occupied[ids[i]] = true;
         g_states[ids[i]] = AioProcessing;
+        g_phases[ids[i]] = Phase::Idle;
     }
     g_nextId = candidate;
     return true;
@@ -65,15 +88,65 @@ void RequireIds(std::int32_t count, std::int32_t* ids, const char* name) {
     if (!AllocateIds(count, ids)) throw std::runtime_error(std::string(name) + ": no free request id is left (a request id stays in use until sceKernelAioDeleteRequest releases it; the console's result when they run out is not known)");
 }
 
-void ReleaseId(std::int32_t id) {
-    std::lock_guard<std::mutex> lock(g_mutex);
-    g_occupied[id] = false;
-    g_states[id] = AioAborted;
+bool Uses(const std::vector<std::int32_t>& descriptors, std::int32_t fd) {
+    return std::find(descriptors.begin(), descriptors.end(), fd) != descriptors.end();
 }
 
-void SetState(std::int32_t id, std::int32_t state) {
+bool Conflicts(const Job& job, const std::vector<std::int32_t>& blocked) {
+    return std::any_of(job.descriptors.begin(), job.descriptors.end(), [&blocked](std::int32_t fd) { return Uses(blocked, fd); });
+}
+
+bool TakeRunnable(Job& job) {
+    std::vector<std::int32_t> blocked = g_activeDescriptors;
+    for (auto candidate = g_queue.begin(); candidate != g_queue.end(); ++candidate) {
+        if (!Conflicts(*candidate, blocked)) {
+            job = std::move(*candidate);
+            g_queue.erase(candidate);
+            return true;
+        }
+        blocked.insert(blocked.end(), candidate->descriptors.begin(), candidate->descriptors.end());
+    }
+    return false;
+}
+
+bool DescriptorBusy(std::int32_t fd) {
+    if (Uses(g_activeDescriptors, fd)) return true;
+    return std::any_of(g_queue.begin(), g_queue.end(), [fd](const Job& job) { return Uses(job.descriptors, fd); });
+}
+
+void WaitIdle(std::unique_lock<std::mutex>& lock, std::int32_t id) {
+    g_changed.wait(lock, [id] { return g_phases[id] == Phase::Idle; });
+}
+
+void ReleaseId(std::int32_t id) {
+    std::unique_lock<std::mutex> lock(g_mutex);
+    const auto queued = std::find_if(g_queue.begin(), g_queue.end(), [id](const Job& job) { return job.id == id; });
+    if (queued != g_queue.end()) {
+        g_queue.erase(queued);
+        g_phases[id] = Phase::Idle;
+        g_states[id] = AioAborted;
+    }
+    WaitIdle(lock, id);
+    g_occupied[id] = false;
+    g_states[id] = AioAborted;
+    g_changed.notify_all();
+}
+
+std::int32_t CancelId(std::int32_t id) {
     std::lock_guard<std::mutex> lock(g_mutex);
-    if (g_occupied[id]) g_states[id] = state;
+    const auto queued = std::find_if(g_queue.begin(), g_queue.end(), [id](const Job& job) { return job.id == id; });
+    if (queued != g_queue.end()) {
+        for (const KernelAioRwRequest& request : queued->requests) std::atomic_ref<std::uint32_t>(request.result->state).store(static_cast<std::uint32_t>(AioAborted), std::memory_order_release);
+        g_queue.erase(queued);
+        g_phases[id] = Phase::Idle;
+        g_states[id] = AioAborted;
+        g_changed.notify_all();
+        g_workAvailable.notify_all();
+    } else if (g_phases[id] == Phase::Idle && g_occupied[id]) {
+        g_states[id] = AioAborted;
+        g_changed.notify_all();
+    }
+    return g_states[id];
 }
 
 std::int64_t NativePread(std::int32_t fd, void* buf, std::size_t nbyte, std::int64_t offset) {
@@ -112,22 +185,66 @@ std::int64_t NativePwrite(std::int32_t fd, const void* buf, std::size_t nbyte, s
 #endif
 }
 
-bool RunRequest(KernelAioRwRequest& req, bool write) {
+void Publish(const KernelAioRwRequest& req, std::int64_t value, std::int32_t state) {
+    req.result->return_value = value;
+    std::atomic_ref<std::uint32_t>(req.result->state).store(static_cast<std::uint32_t>(state), std::memory_order_release);
+}
+
+bool RunRequest(const KernelAioRwRequest& req, bool write) {
+    if (const auto gate = g_gate.load(std::memory_order_acquire)) gate(req.fd, write, req.offset);
     const std::int64_t done = write
         ? NativePwrite(req.fd, req.buf, req.nbyte, req.offset)
         : NativePread(req.fd, req.buf, req.nbyte, req.offset);
     if (done < 0) {
         const int error = errno;
-        req.result->return_value = static_cast<std::int64_t>(SCE_KERNEL_ERROR_EIO);
-        if (error == EBADF) req.result->return_value = static_cast<std::int64_t>(SCE_KERNEL_ERROR_EBADF);
-        if (error == EFAULT) req.result->return_value = static_cast<std::int64_t>(SCE_KERNEL_ERROR_EFAULT);
-        if (error == EINVAL) req.result->return_value = static_cast<std::int64_t>(SCE_KERNEL_ERROR_EINVAL);
-        req.result->state = AioAborted;
+        std::int64_t code = static_cast<std::int64_t>(SCE_KERNEL_ERROR_EIO);
+        if (error == EBADF) code = static_cast<std::int64_t>(SCE_KERNEL_ERROR_EBADF);
+        if (error == EFAULT) code = static_cast<std::int64_t>(SCE_KERNEL_ERROR_EFAULT);
+        if (error == EINVAL) code = static_cast<std::int64_t>(SCE_KERNEL_ERROR_EINVAL);
+        Publish(req, code, AioAborted);
         return false;
     }
-    req.result->return_value = done;
-    req.result->state = AioCompleted;
+    Publish(req, done, AioCompleted);
     return true;
+}
+
+void WorkerLoop() {
+    std::unique_lock<std::mutex> lock(g_mutex);
+    for (;;) {
+        Job job;
+        g_workAvailable.wait(lock, [&job] { return TakeRunnable(job); });
+        g_phases[job.id] = Phase::Running;
+        g_activeDescriptors.insert(g_activeDescriptors.end(), job.descriptors.begin(), job.descriptors.end());
+        lock.unlock();
+        bool aborted = false;
+        for (const KernelAioRwRequest& request : job.requests) {
+            if (!RunRequest(request, job.write)) aborted = true;
+        }
+        lock.lock();
+        for (const std::int32_t fd : job.descriptors) g_activeDescriptors.erase(std::find(g_activeDescriptors.begin(), g_activeDescriptors.end(), fd));
+        if (g_occupied[job.id]) g_states[job.id] = aborted ? AioAborted : AioCompleted;
+        g_phases[job.id] = Phase::Idle;
+        g_changed.notify_all();
+        g_workAvailable.notify_all();
+    }
+}
+
+void EnsureWorkers() {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (g_workers != 0) return;
+    g_workers = std::clamp<std::size_t>(std::thread::hardware_concurrency() / 2, 2, 4);
+    for (std::size_t index = 0; index < g_workers; ++index) std::thread(WorkerLoop).detach();
+}
+
+void Enqueue(Job job) {
+    EnsureWorkers();
+    std::lock_guard<std::mutex> lock(g_mutex);
+    for (const KernelAioRwRequest& request : job.requests) {
+        if (!Uses(job.descriptors, request.fd)) job.descriptors.push_back(request.fd);
+    }
+    g_phases[job.id] = Phase::Queued;
+    g_queue.push_back(std::move(job));
+    g_workAvailable.notify_all();
 }
 
 int ValidateRequests(KernelAioRwRequest* req, std::int32_t size, const void* id) {
@@ -144,12 +261,8 @@ int SubmitCommands(KernelAioRwRequest* req, std::int32_t size, bool write, std::
     if (error != 0) return error;
     std::int32_t queue = 0;
     RequireIds(1, &queue, name);
-    bool aborted = false;
-    for (std::int32_t i = 0; i < size; ++i) {
-        if (!RunRequest(req[i], write)) aborted = true;
-    }
-    SetState(queue, aborted ? AioAborted : AioCompleted);
     *id = queue;
+    Enqueue(Job{queue, write, std::vector<KernelAioRwRequest>(req, req + size), {}});
     return 0;
 }
 
@@ -159,10 +272,8 @@ int SubmitCommandsMultiple(KernelAioRwRequest* req, std::int32_t size, bool writ
     if (error != 0) return error;
     std::array<std::int32_t, AioRequestNumMax> queues{};
     RequireIds(size, queues.data(), name);
-    for (std::int32_t i = 0; i < size; ++i) {
-        SetState(queues[i], RunRequest(req[i], write) ? AioCompleted : AioAborted);
-        id[i] = queues[i];
-    }
+    for (std::int32_t i = 0; i < size; ++i) id[i] = queues[i];
+    for (std::int32_t i = 0; i < size; ++i) Enqueue(Job{queues[i], write, {req[i]}, {}});
     return 0;
 }
 
@@ -205,8 +316,7 @@ int APS5_VABI sceKernelAioCancelRequest(int32_t id, int32_t* state) {
         return 0;
     }
     if (!ValidId(id)) return SCE_KERNEL_ERROR_EINVAL;
-    SetState(id, AioAborted);
-    *state = AioAborted;
+    *state = CancelId(id);
     return 0;
 }
 
@@ -222,8 +332,7 @@ int APS5_VABI sceKernelAioCancelRequests(int32_t* id, int32_t num, int32_t* stat
             state[i] = AioProcessing;
             continue;
         }
-        SetState(id[i], AioAborted);
-        state[i] = AioAborted;
+        state[i] = CancelId(id[i]);
     }
     return 0;
 }
@@ -284,49 +393,42 @@ int APS5_VABI sceKernelAioWaitRequests(int32_t* id, int32_t num, int32_t* state,
     const int error = ValidateIds(id, num, state, "sceKernelAioWaitRequests");
     if (error != 0) return error;
     if (mode != AioWaitAnd && mode != AioWaitOr) throw std::runtime_error("sceKernelAioWaitRequests: unsupported wait mode");
-    const auto start = std::chrono::steady_clock::now();
+    const bool timed = usec != nullptr && *usec != 0;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(timed ? *usec : 0);
+    std::unique_lock<std::mutex> lock(g_mutex);
     for (;;) {
         bool allDone = true;
         bool anyCompleted = false;
-        {
-            std::lock_guard<std::mutex> lock(g_mutex);
-            for (int32_t i = 0; i < num; ++i) {
-                state[i] = g_states[id[i]];
-                if (state[i] == AioProcessing) allDone = false;
-                if (state[i] == AioCompleted) anyCompleted = true;
-            }
+        for (int32_t i = 0; i < num; ++i) {
+            state[i] = g_states[id[i]];
+            if (state[i] == AioProcessing) allDone = false;
+            if (state[i] == AioCompleted) anyCompleted = true;
         }
         if (allDone || (mode == AioWaitOr && anyCompleted)) return 0;
-        if (usec != nullptr && *usec != 0) {
-            const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count();
-            if (elapsed > static_cast<std::int64_t>(*usec)) return SCE_KERNEL_ERROR_ETIMEDOUT;
+        if (!timed) {
+            g_changed.wait(lock);
+        } else if (g_changed.wait_until(lock, deadline) == std::cv_status::timeout) {
+            for (int32_t i = 0; i < num; ++i) state[i] = g_states[id[i]];
+            return SCE_KERNEL_ERROR_ETIMEDOUT;
         }
-        PreciseSleepUs(10);
     }
 }
 
 int APS5_VABI sceKernelAioWaitRequest(int32_t id, int32_t* state, uint32_t* usec) {
     if (state == nullptr) return SCE_KERNEL_ERROR_EFAULT;
     if (!ValidId(id)) return SCE_KERNEL_ERROR_EINVAL;
-    const auto start = std::chrono::steady_clock::now();
+    const bool timed = usec != nullptr && *usec != 0;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(timed ? *usec : 0);
+    std::unique_lock<std::mutex> lock(g_mutex);
     for (;;) {
-        std::int32_t current;
-        {
-            std::lock_guard<std::mutex> lock(g_mutex);
-            current = g_states[id];
+        *state = g_states[id];
+        if (*state != AioProcessing) return 0;
+        if (!timed) {
+            g_changed.wait(lock);
+        } else if (g_changed.wait_until(lock, deadline) == std::cv_status::timeout) {
+            *state = g_states[id];
+            return *state == AioProcessing ? SCE_KERNEL_ERROR_ETIMEDOUT : 0;
         }
-        if (current != AioProcessing) {
-            *state = current;
-            return 0;
-        }
-        if (usec != nullptr && *usec != 0) {
-            const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count();
-            if (elapsed > static_cast<std::int64_t>(*usec)) {
-                *state = current;
-                return SCE_KERNEL_ERROR_ETIMEDOUT;
-            }
-        }
-        PreciseSleepUs(10);
     }
 }
 
@@ -336,6 +438,19 @@ int APS5_VABI sceKernelAioPollRequests(int32_t* id, int32_t num, int32_t* state)
     std::lock_guard<std::mutex> lock(g_mutex);
     for (int32_t i = 0; i < num; ++i) state[i] = g_states[id[i]];
     return 0;
+}
+
+}
+
+namespace Aio {
+
+void DrainDescriptor(std::int32_t fd) {
+    std::unique_lock<std::mutex> lock(g_mutex);
+    g_changed.wait(lock, [fd] { return !DescriptorBusy(fd); });
+}
+
+void SetTransferGate_nid_no_patch(TransferGate gate) {
+    g_gate.store(gate, std::memory_order_release);
 }
 
 }
