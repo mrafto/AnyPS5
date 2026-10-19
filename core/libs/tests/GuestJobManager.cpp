@@ -215,6 +215,20 @@ static void APS5_VABI CountJob(void* argument, std::uint32_t index) {
     ++tally.calls;
 }
 
+struct Rendezvous {
+    std::uint32_t needed;
+    std::atomic<std::uint32_t> arrived{0};
+    std::atomic<std::uint32_t> met{0};
+};
+
+static void APS5_VABI RendezvousJob(void* argument, std::uint32_t) {
+    auto& rendezvous = *static_cast<Rendezvous*>(argument);
+    ++rendezvous.arrived;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (rendezvous.arrived.load() < rendezvous.needed && std::chrono::steady_clock::now() < deadline) std::this_thread::yield();
+    if (rendezvous.arrived.load() >= rendezvous.needed) ++rendezvous.met;
+}
+
 static void DispatchCase() {
     Block block(SizeFor(4, 1, 8, 2, 2));
     ManagerObject manager;
@@ -230,6 +244,14 @@ static void DispatchCase() {
     Require(tally.calls == 1000 && single.calls == 1);
     for (const auto& count : tally.seen) Require(count == 1);
     Require(sequence->Wait() == 0);
+    Rendezvous wide{4};
+    Require(sequence->Dispatch(RendezvousJob, &wide, 4, "wide") == 0);
+    Require(sequence->Wait() == 0);
+    Require(wide.met == 4);
+    Rendezvous separate{4};
+    for (int dispatch = 0; dispatch < 4; ++dispatch) Require(sequence->Dispatch(RendezvousJob, &separate, 1, "separate") == 0);
+    Require(sequence->Wait() == 0);
+    Require(separate.met == 4);
     Require(factory->Destroy(sequence) == 0);
     Require(Shutdown(manager.storage) == 0);
 }

@@ -239,6 +239,11 @@ struct Manager {
     std::array<Factory, 2> factories;
     std::array<Factory, 2> unifiedFactories;
     std::vector<Pthread> workers;
+
+    void WakeWorkers(std::uint32_t jobs) {
+        const auto wake = std::min<std::size_t>(jobs, workers.size());
+        for (std::size_t index = 0; index < wake; ++index) work.notify_one();
+    }
 };
 
 Manager*& Implementation(void* self) {
@@ -288,7 +293,7 @@ void Sequence::Advance() {
             ++outstanding;
             ++cursor;
             manager->runQueues[priority].push_back(&item);
-            manager->work.notify_all();
+            manager->WakeWorkers(item.count);
             continue;
         }
         if (item.type == ItemType::Compute || item.type == ItemType::ComputeIndirect) {
