@@ -37,24 +37,43 @@ constexpr std::uint32_t AioSplitChunkSizeMax = 0x1000000;
 
 std::mutex g_mutex;
 std::array<std::int32_t, AioMaxQueues> g_states{};
+std::array<bool, AioMaxQueues> g_occupied{};
 std::int32_t g_nextId = 1;
 
 bool ValidId(std::int32_t id) {
     return id > 0 && id < AioMaxQueues;
 }
 
-std::int32_t AllocateId() {
+bool AllocateIds(std::int32_t count, std::int32_t* ids) {
     std::lock_guard<std::mutex> lock(g_mutex);
-    const std::int32_t id = g_nextId;
-    g_nextId = (g_nextId + 1) % AioMaxQueues;
-    if (g_nextId == 0) g_nextId = 1;
-    g_states[id] = AioProcessing;
-    return id;
+    std::int32_t found = 0;
+    std::int32_t candidate = g_nextId;
+    for (std::int32_t scanned = 0; scanned < AioMaxQueues - 1 && found < count; ++scanned) {
+        if (!g_occupied[candidate]) ids[found++] = candidate;
+        candidate = candidate + 1 >= AioMaxQueues ? 1 : candidate + 1;
+    }
+    if (found < count) return false;
+    for (std::int32_t i = 0; i < count; ++i) {
+        g_occupied[ids[i]] = true;
+        g_states[ids[i]] = AioProcessing;
+    }
+    g_nextId = candidate;
+    return true;
+}
+
+void RequireIds(std::int32_t count, std::int32_t* ids, const char* name) {
+    if (!AllocateIds(count, ids)) throw std::runtime_error(std::string(name) + ": no free request id is left (a request id stays in use until sceKernelAioDeleteRequest releases it; the console's result when they run out is not known)");
+}
+
+void ReleaseId(std::int32_t id) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_occupied[id] = false;
+    g_states[id] = AioAborted;
 }
 
 void SetState(std::int32_t id, std::int32_t state) {
     std::lock_guard<std::mutex> lock(g_mutex);
-    g_states[id] = state;
+    if (g_occupied[id]) g_states[id] = state;
 }
 
 std::int64_t NativePread(std::int32_t fd, void* buf, std::size_t nbyte, std::int64_t offset) {
@@ -120,10 +139,11 @@ int ValidateRequests(KernelAioRwRequest* req, std::int32_t size, const void* id)
     return 0;
 }
 
-int SubmitCommands(KernelAioRwRequest* req, std::int32_t size, bool write, std::int32_t* id) {
+int SubmitCommands(KernelAioRwRequest* req, std::int32_t size, bool write, std::int32_t* id, const char* name) {
     const int error = ValidateRequests(req, size, id);
     if (error != 0) return error;
-    const std::int32_t queue = AllocateId();
+    std::int32_t queue = 0;
+    RequireIds(1, &queue, name);
     bool aborted = false;
     for (std::int32_t i = 0; i < size; ++i) {
         if (!RunRequest(req[i], write)) aborted = true;
@@ -137,10 +157,11 @@ int SubmitCommandsMultiple(KernelAioRwRequest* req, std::int32_t size, bool writ
     if (req != nullptr && id != nullptr && size > AioRequestNumMax) throw std::runtime_error(std::string(name) + ": more than 128 requests per batch is not modelled");
     const int error = ValidateRequests(req, size, id);
     if (error != 0) return error;
+    std::array<std::int32_t, AioRequestNumMax> queues{};
+    RequireIds(size, queues.data(), name);
     for (std::int32_t i = 0; i < size; ++i) {
-        const std::int32_t queue = AllocateId();
-        SetState(queue, RunRequest(req[i], write) ? AioCompleted : AioAborted);
-        id[i] = queue;
+        SetState(queues[i], RunRequest(req[i], write) ? AioCompleted : AioAborted);
+        id[i] = queues[i];
     }
     return 0;
 }
@@ -162,7 +183,7 @@ extern "C" {
 int APS5_VABI sceKernelAioDeleteRequest(int32_t id, int32_t* ret) {
     if (ret == nullptr) return SCE_KERNEL_ERROR_EFAULT;
     if (!ValidId(id)) return SCE_KERNEL_ERROR_EINVAL;
-    SetState(id, AioAborted);
+    ReleaseId(id);
     *ret = 0;
     return 0;
 }
@@ -171,7 +192,7 @@ int APS5_VABI sceKernelAioDeleteRequests(int32_t* id, int32_t num, int32_t* ret)
     const int error = ValidateIds(id, num, ret, "sceKernelAioDeleteRequests");
     if (error != 0) return error;
     for (int32_t i = 0; i < num; ++i) {
-        SetState(id[i], AioAborted);
+        ReleaseId(id[i]);
         ret[i] = 0;
     }
     return 0;
@@ -233,12 +254,12 @@ int APS5_VABI sceKernelAioSetParam(KernelAioSchedulingParam* param, int32_t sche
 
 int APS5_VABI sceKernelAioSubmitReadCommands(KernelAioRwRequest* req, int32_t size, int32_t prio, int32_t* id) {
     (void)prio;
-    return SubmitCommands(req, size, false, id);
+    return SubmitCommands(req, size, false, id, "sceKernelAioSubmitReadCommands");
 }
 
 int APS5_VABI sceKernelAioSubmitWriteCommands(KernelAioRwRequest* req, int32_t size, int32_t prio, int32_t* id) {
     (void)prio;
-    return SubmitCommands(req, size, true, id);
+    return SubmitCommands(req, size, true, id, "sceKernelAioSubmitWriteCommands");
 }
 
 int APS5_VABI sceKernelAioSubmitReadCommandsMultiple(KernelAioRwRequest* req, int32_t size, int32_t prio, int32_t* id) {

@@ -389,11 +389,91 @@ int main(int argc, char** argv) {
                     result.return_value != 16 || std::memcmp(bytes.data(), sharedContents.data() + offset, 16) != 0) {
                     misread = true;
                 }
+                std::int32_t released = -1;
+                if (sceKernelAioDeleteRequest(requestId, &released) != 0 || released != 0) misread = true;
             }
         });
     }
     for (auto& reader : readers) reader.join();
     Check(!misread);
+    {
+        std::array<char, 16> bytes{};
+        KernelAioRwRequest request{0, bytes.size(), bytes.data(), nullptr, sharedFd};
+        KernelAioResult result{-1, 0};
+        request.result = &result;
+        std::vector<std::int32_t> retained;
+        std::int32_t extra = 0;
+        for (;;) {
+            std::int32_t requestId = 0;
+            bool exhausted = false;
+            try { Check(sceKernelAioSubmitReadCommands(&request, 1, 0, &requestId) == 0); } catch (const std::runtime_error&) { exhausted = true; }
+            if (exhausted) break;
+            retained.push_back(requestId);
+            Check(retained.size() < 600);
+        }
+        std::vector<bool> seen(512, false);
+        for (const auto retainedId : retained) {
+            Check(retainedId > 0 && retainedId < 512 && !seen[retainedId]);
+            seen[retainedId] = true;
+        }
+        std::int32_t state = 0;
+        for (const auto retainedId : retained) {
+            Check(sceKernelAioPollRequest(retainedId, &state) == 0 && state == 3);
+        }
+        bool again = false;
+        try { sceKernelAioSubmitReadCommands(&request, 1, 0, &extra); } catch (const std::runtime_error&) { again = true; }
+        Check(again && extra == 0);
+        std::array<KernelAioRwRequest, 2> pair{request, request};
+        std::array<KernelAioResult, 2> pairResults{};
+        pair[0].result = &pairResults[0];
+        pair[1].result = &pairResults[1];
+        std::array<std::int32_t, 2> pairIds{};
+        const std::int32_t victim = retained[retained.size() / 2];
+        std::int32_t released = -1;
+        Check(sceKernelAioDeleteRequest(victim, &released) == 0);
+        bool tooFew = false;
+        try { sceKernelAioSubmitReadCommandsMultiple(pair.data(), 2, 0, pairIds.data()); } catch (const std::runtime_error&) { tooFew = true; }
+        Check(tooFew && pairIds[0] == 0 && pairIds[1] == 0 && pairResults[0].state == 0 && pairResults[1].state == 0);
+        std::int32_t reused = 0;
+        Check(sceKernelAioSubmitReadCommands(&request, 1, 0, &reused) == 0);
+        Check(reused == victim);
+        for (const auto retainedId : retained) {
+            if (retainedId == victim) continue;
+            Check(sceKernelAioPollRequest(retainedId, &state) == 0 && state == 3);
+        }
+        Check(sceKernelAioDeleteRequest(reused, &released) == 0);
+        Check(sceKernelAioDeleteRequest(reused, &released) == 0);
+        std::int32_t repeat = 0;
+        Check(sceKernelAioSubmitReadCommands(&request, 1, 0, &repeat) == 0 && repeat == victim);
+        Check(sceKernelAioDeleteRequest(repeat, &released) == 0);
+        for (const auto retainedId : retained) {
+            Check(sceKernelAioDeleteRequest(retainedId, &released) == 0);
+        }
+    }
+    {
+        std::array<std::atomic<bool>, 512> held{};
+        std::atomic<bool> clash{false};
+        std::vector<std::thread> workers;
+        for (int worker = 0; worker < 8; ++worker) {
+            workers.emplace_back([&] {
+                std::array<char, 16> bytes{};
+                for (int i = 0; i < 500 && !clash; ++i) {
+                    KernelAioResult result{-1, 0};
+                    KernelAioRwRequest request{0, bytes.size(), bytes.data(), &result, sharedFd};
+                    std::int32_t requestId = 0;
+                    if (sceKernelAioSubmitReadCommands(&request, 1, 0, &requestId) != 0 || held[requestId].exchange(true)) {
+                        clash = true;
+                        return;
+                    }
+                    held[requestId] = false;
+                    std::int32_t released = -1;
+                    if (sceKernelAioDeleteRequest(requestId, &released) != 0) clash = true;
+                }
+            });
+        }
+        for (auto& worker : workers) worker.join();
+        Check(!clash);
+    }
     Check(sceKernelClose(sharedFd) == 0);
     Check(std::filesystem::remove_all(root) > 0);
 }
