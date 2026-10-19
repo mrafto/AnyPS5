@@ -8,7 +8,13 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <stdexcept>
 
+extern "C" {
+int APS5_VABI sceHmd2GazeActivateGazeTracking();
+int APS5_VABI sceHmd2ReprojectionGetCurrentOutput();
+int APS5_VABI sceHmd2SetFieldOfView();
+}
 namespace {
 
 alignas(16) std::array<std::byte, 0x40> process{};
@@ -61,6 +67,27 @@ int main() {
     InstallProcessParameters();
     TestBeforeInitialize();
     TestWithoutHeadset();
+    bool threw = false;
+    try {
+        sceHmd2GazeActivateGazeTracking();
+    } catch (const std::runtime_error&) {
+        threw = true;
+    }
+    Require(threw, "gaze activation did not throw");
+    threw = false;
+    try {
+        sceHmd2ReprojectionGetCurrentOutput();
+    } catch (const std::runtime_error&) {
+        threw = true;
+    }
+    Require(threw, "reprojection get current output did not throw");
+    threw = false;
+    try {
+        sceHmd2SetFieldOfView();
+    } catch (const std::runtime_error&) {
+        threw = true;
+    }
+    Require(threw, "set field of view did not throw");
     std::puts("HMD2 tests passed");
     return 0;
 }

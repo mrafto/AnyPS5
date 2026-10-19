@@ -89,6 +89,8 @@ struct GuestPollEntry {
 int APS5_VABI poll_nid_postfix(GuestPollEntry*, std::uint32_t, int);
 int* APS5_VABI __error_nid_postfix();
 int APS5_VABI sceNetInetPton(int, const char*, void*);
+int APS5_VABI sceNetInetPtonEx(int, const char*, void*, int);
+int APS5_VABI sceNetUsleep(int);
 const char* APS5_VABI sceNetInetNtop(int, const void*, char*, std::uint32_t);
 int* APS5_VABI sceNetErrnoLoc(void);
 }
@@ -715,6 +717,34 @@ static void CheckAddressText(int family, const char* text) {
     Require(sceNetInetNtop(family, address.data(), nullptr, output.size()) == nullptr && *sceNetErrnoLoc() == 22);
 }
 
+static void CheckInetPtonEx() {
+    std::array<std::uint8_t, 16> address{};
+    Require(sceNetInetPtonEx(2, "192.168.1.20", address.data(), 0) == 1);
+    Require(address[0] == 192 && address[1] == 168 && address[2] == 1 && address[3] == 20);
+    std::array<std::uint8_t, 16> expected{};
+    Require(sceNetInetPton(28, "fe80::1:2", expected.data()) == 1);
+    address.fill(0);
+    Require(sceNetInetPtonEx(28, "fe80::1:2", address.data(), 0) == 1 && address == expected);
+    Require(sceNetInetPtonEx(2, "not an address", address.data(), 0) == 0);
+    Require(Failed(sceNetInetPtonEx(99, "127.0.0.1", address.data(), 0), 47));
+    Require(Failed(sceNetInetPtonEx(2, nullptr, address.data(), 0), 22));
+    Require(Failed(sceNetInetPtonEx(2, "127.0.0.1", nullptr, 0), 22));
+    for (const int flags : {1, -1}) {
+        bool threw = false;
+        try { sceNetInetPtonEx(2, "127.0.0.1", address.data(), flags); } catch (const std::runtime_error&) { threw = true; }
+        Require(threw);
+    }
+}
+
+static void CheckUsleep() {
+    Require(sceNetUsleep(0) == 0);
+    const auto start = std::chrono::steady_clock::now();
+    Require(sceNetUsleep(2000) == 0);
+    Require(std::chrono::steady_clock::now() - start >= std::chrono::microseconds(2000));
+    *sceNetErrnoLoc() = 0;
+    Require(Failed(sceNetUsleep(-1), 22));
+}
+
 static void CheckEpollIdent() {
     std::array<std::uint8_t, 16> address{16, 2, 0, 0, 127, 0, 0, 1};
     const int receiver = sceNetSocket("epoll-ident", 2, 2, 17);
@@ -1139,6 +1169,8 @@ int main() {
     CheckAddressText(2, "255.255.255.255");
     CheckAddressText(28, "::1");
     CheckAddressText(28, "1234:5678:9abc:def0:1234:5678:9abc:def0");
+    CheckInetPtonEx();
+    CheckUsleep();
     CheckEpollIdent();
     CheckLinkLocalAllNodesIpv6();
     CheckUnboundSocketName();

@@ -163,6 +163,8 @@ std::uint64_t ProgramHeaderLayoutBuilder::GuestLoadPageEnd(
         if (ph.Type != PT_LOAD)
             continue;
         foundLoad = true;
+        if (ph.FileSize > ph.MemorySize)
+            throw Domain::RelinkerException("PT_LOAD file size exceeds memory size", ph.Offset);
         if (ph.MemorySize > std::numeric_limits<std::uint64_t>::max() - ph.MappedAddress)
             throw Domain::RelinkerException("Load segment virtual range overflowed");
         const std::uint64_t vaddrEnd = ph.MappedAddress + ph.MemorySize;
@@ -206,8 +208,12 @@ std::uint16_t ProgramHeaderLayoutBuilder::WriteLayout(
     if (tableEnd > buf.size())
         throw Domain::RelinkerException("Program header table exceeds the output file");
     const bool tableInExtraBlock = request.PhOff >= request.ExtraBlockOffset;
-    if (tableInExtraBlock && tableEnd - request.ExtraBlockOffset > request.ExtraBlockSize)
-        throw Domain::RelinkerException("Program header table does not fit within the extra block");
+    if (tableInExtraBlock) {
+        if (tableEnd - request.ExtraBlockOffset > request.ExtraBlockSize)
+            throw Domain::RelinkerException("Program header table does not fit within the extra block");
+    } else if (tableEnd > request.ExtraBlockOffset) {
+        throw Domain::RelinkerException("Program header table overlaps the extra block");
+    }
     const std::uint64_t headerBlockSize = tableInExtraBlock ? kElfHeaderSize : tableEnd;
     if (request.ExtraBlockOffset > buf.size() || request.ExtraBlockSize > buf.size() - request.ExtraBlockOffset)
         throw Domain::RelinkerException("Extra block exceeds the output file");

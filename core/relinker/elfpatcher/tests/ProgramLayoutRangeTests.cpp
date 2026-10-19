@@ -97,7 +97,7 @@ int main() {
                 case 7: request.InterpOffset = maximum; break;
                 case 8: request.ExtraBlockOffset = maximum; break;
                 case 9: request.ExtraBlockSize = 0x1000; break;
-                case 10: request.PhOff = 0xF00; request.ExtraBlockVaddr = maximum - 0x1fff; break;
+                case 10: request.PhOff = 0xF00; break;
             }
             std::vector<std::uint8_t> bytes(0x1100, 0xA5);
             const auto before = bytes;

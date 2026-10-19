@@ -247,13 +247,13 @@ PeDirectory WindowsTlsBuilder::Build(const std::vector<std::uint8_t>& source, co
         if (displacement != stackGuardDisplacement && (displacement > 0 || displacement < -static_cast<std::int64_t>(threadPointerOffset)))
             throw Domain::RelinkerException("Windows guest TLS load displacement " + std::to_string(displacement) + " is not in the thread TLS block, 0 or the stack guard at 0x28", access.FileOffset);
     }
-    PeSection data{".gtls", nextRva, SectionRead | SectionWrite | 0x40u, std::vector<std::uint8_t>(templateOffset + blockSize + threadControlBlockSize)};
+    PeSection data{".gtls", nextRva, SectionRead | SectionWrite | 0x40u, std::vector<std::uint8_t>(templateOffset + tls->FileSize), CheckedRva(templateOffset + blockSize + threadControlBlockSize)};
 
     const auto indexRva = nextRva + 40;
     if (tlsIndexRva != nullptr) *tlsIndexRva = indexRva;
     const auto callbackTableRva = nextRva + 48;
     const auto templateRva = nextRva + templateOffset;
-    const auto codeRva = AlignRva(nextRva + data.Data.size());
+    const auto codeRva = AlignRva(nextRva + data.MemorySize());
 
     WindowsStubEmitter code(codeRva);
     const auto loadPointer = [&] {

@@ -1,9 +1,12 @@
+import contextlib
+import io
 import struct
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import unwrap_self
@@ -303,6 +306,94 @@ class UnwrapTest(unittest.TestCase):
                 self.assertEqual(data[headers[0][2]:headers[0][2] + headers[0][5]], pattern(1, 0x100))
                 self.assertEqual(data[headers[1][2]:headers[1][2] + headers[1][5]], pattern(9, 0x80))
                 self.assertEqual((Path(self.directory) / "input.self").read_bytes(), original)
+
+    def test_file_empty_load_preserves_alignment_and_memory(self):
+        for alignment, address in ((0, 0x4010), (1, 0x4010), (PAGE, 0x4010),
+                                   (PAGE, 0x4FFF), (0x10000, 0x1FFFF), (1 << 40, (1 << 40) + 16)):
+            for memory_size in (0, 0x2000):
+                with self.subTest(alignment=alignment, address=address, memory_size=memory_size):
+                    segments = default_segments() + [(PT_LOAD, 6, 0xFFFFFFFFFFFFFFFF, address, 0, alignment)]
+                    container = bytearray(build_container(segments, default_records(), default_payloads()))
+                    struct.pack_into("<Q", container, ELF_HEADER_OFFSET + PROGRAM_TABLE_OFFSET + 3 * 56 + 40, memory_size)
+                    result, output = self.convert(container)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    data, headers = read_program_headers(output)
+                    load = headers[3]
+                    self.assertEqual(load[:2], (PT_LOAD, 6))
+                    self.assertEqual(load[3:], (address, address, 0, memory_size, alignment))
+                    self.assertEqual(load[2] % max(alignment, 1), address % max(alignment, 1))
+                    self.assertLessEqual(load[2], len(data))
+                    self.assertEqual(data[headers[0][2]:headers[0][2] + headers[0][5]], pattern(1, 0x100))
+                    self.assertEqual(data[headers[1][2]:headers[1][2] + headers[1][5]], pattern(9, 0x80))
+                    self.assertEqual((Path(self.directory) / "input.self").read_bytes(), container)
+
+    def test_file_empty_load_alignment_without_file_backed_regions(self):
+        segments = [(PT_LOAD, 6, 0xFFFFFFFFFFFFFFFF, 0x1FFFF, 0, 0x10000)]
+        container = bytearray(build_container(segments, [], {}))
+        struct.pack_into("<Q", container, ELF_HEADER_OFFSET + PROGRAM_TABLE_OFFSET + 40, 0x2000)
+        result, output = self.convert(container)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        data, headers = read_program_headers(output)
+        load = headers[0]
+        self.assertEqual(load[3:], (0x1FFFF, 0x1FFFF, 0, 0x2000, 0x10000))
+        self.assertEqual(load[2] % load[7], load[3] % load[7])
+        self.assertLessEqual(load[2], len(data))
+
+    def test_excessive_empty_load_padding_is_refused_before_allocation(self):
+        segments = [(PT_LOAD, 6, 0, (1 << 40) - 1, 0, 1 << 40)]
+        container = bytearray(build_container(segments, [], {}))
+        struct.pack_into("<Q", container, ELF_HEADER_OFFSET + PROGRAM_TABLE_OFFSET + 40, 0x2000)
+        source = Path(self.directory) / "input.self"
+        output = Path(self.directory) / "output.elf"
+        source.write_bytes(container)
+
+        def allocate(value):
+            if isinstance(value, int):
+                self.assertLessEqual(value, len(container) + unwrap_self.MAX_EMPTY_LOAD_PADDING)
+            return bytearray(value)
+
+        for previous in (None, b"previous output"):
+            with self.subTest(previous=previous):
+                if previous is not None:
+                    output.write_bytes(previous)
+                with mock.patch.object(unwrap_self, "bytearray", side_effect=allocate, create=True), \
+                        mock.patch.object(sys, "argv", ["unwrap_self.py", str(source), str(output)]), \
+                        contextlib.redirect_stdout(io.StringIO()) as stdout, \
+                        contextlib.redirect_stderr(io.StringIO()) as stderr:
+                    self.assertEqual(unwrap_self.main(), 2)
+                self.assertEqual(stdout.getvalue(), "")
+                self.assertIn("empty load alignment requires more than", stderr.getvalue())
+                self.assertNotIn("Traceback", stderr.getvalue())
+                if previous is not None:
+                    self.assertEqual(output.read_bytes(), previous)
+                else:
+                    self.assertFalse(output.exists())
+                self.assertEqual(source.read_bytes(), container)
+
+    def test_empty_load_padding_limit_counts_only_added_bytes(self):
+        baseline, output = self.convert(build_container(default_segments(), default_records(), default_payloads()))
+        self.assertEqual(baseline.returncode, 0, baseline.stderr)
+        baseline_size = output.stat().st_size
+        limit = 0x100
+        for extra in (-1, limit, limit + 1):
+            with self.subTest(extra=extra):
+                address = 0x10000 + baseline_size + extra
+                segments = default_segments() + [(PT_LOAD, 6, 0, address, 0, 0x10000)]
+                container = build_container(segments, default_records(), default_payloads())
+                source = Path(self.directory) / "input.self"
+                source.write_bytes(container)
+                previous = output.read_bytes()
+                with mock.patch.object(unwrap_self, "MAX_EMPTY_LOAD_PADDING", limit):
+                    if extra <= limit:
+                        unwrap_self.unwrap(source, output)
+                        data, headers = read_program_headers(output)
+                        self.assertEqual(len(data), baseline_size + max(extra, 0))
+                        self.assertEqual(headers[3][2], baseline_size + extra)
+                        self.assertEqual(headers[3][2] % headers[3][7], address % headers[3][7])
+                    else:
+                        with self.assertRaisesRegex(unwrap_self.Refused, "empty load alignment requires more than"):
+                            unwrap_self.unwrap(source, output)
+                        self.assertEqual(output.read_bytes(), previous)
 
     def test_invalid_load_metadata_is_refused_before_replacing_output(self):
         output = Path(self.directory) / "output.elf"

@@ -49,7 +49,7 @@
 - [sceNetGetSystemTime](../../../core/libs/prx/libSceNet/Export.cpp) (libSceNet) - unknown signature
 - [sceNetGetSystemMemInfo](../../../core/libs/prx/libSceNet/Export.cpp) (libSceNet) - unknown signature
 - [sceNetInitParam](../../../core/libs/prx/libSceNet/Export.cpp) (libSceNet) - unknown signature
-- [sceNetInetPtonEx](../../../core/libs/prx/libSceNet/Export.cpp) (libSceNet) - unknown signature
+- [sceNetInetPtonEx](../../../core/libs/prx/libSceNet/Export.cpp) (libSceNet) - the `(int af, const char* src, void* dst, int flags)` signature follows [shadPS4](https://github.com/shadps4-emu/shadPS4/blob/main/src/core/libraries/net/net.cpp), which forwards it to `sceNetInetPton` and does not know the flags either. Flags 0 converts as `sceNetInetPton` does; any other flags throw, since their meaning (an IPv6 scope or otherwise) is not known. Unverified on hardware
 - [sceNetIoctl](../../../core/libs/prx/libSceNet/Export.cpp) (libSceNet) - unknown signature
 - [sceNetMemoryAllocate](../../../core/libs/prx/libSceNet/Export.cpp) (libSceNet) - unknown signature
 - [sceNetMemoryFree](../../../core/libs/prx/libSceNet/Export.cpp) (libSceNet) - unknown signature
@@ -65,7 +65,7 @@
 - [sceNetThreadCreate](../../../core/libs/prx/libSceNet/Export.cpp) (libSceNet) - unknown signature
 - [sceNetThreadExit](../../../core/libs/prx/libSceNet/Export.cpp) (libSceNet) - unknown signature
 - [sceNetThreadJoin](../../../core/libs/prx/libSceNet/Export.cpp) (libSceNet) - unknown signature
-- [sceNetUsleep](../../../core/libs/prx/libSceNet/Export.cpp) (libSceNet) - unknown signature
+- [sceNetUsleep](../../../core/libs/prx/libSceNet/Export.cpp) (libSceNet) - the `(int microseconds)` signature and the `EINVAL` failure for a negative count follow [shadPS4](https://github.com/shadps4-emu/shadPS4/blob/main/src/core/libraries/net/net.cpp); other counts sleep through libkernel's `sceKernelUsleep`, a cancellation point, and return 0. Whether the console takes the count as signed, and what it returns, is unverified on hardware
 - [sceNetShowIfconfigForBuffer](../../../core/libs/prx/libSceNet/Export.cpp) (libSceNet) - unknown signature
 - [sceNetShowRouteForBuffer](../../../core/libs/prx/libSceNet/Export.cpp) (libSceNet) - unknown signature
 - [sceNetShowNetstatForBuffer](../../../core/libs/prx/libSceNet/Export.cpp) (libSceNet) - unknown signature

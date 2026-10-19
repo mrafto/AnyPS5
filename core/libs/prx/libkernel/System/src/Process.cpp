@@ -470,11 +470,19 @@ int APS5_VABI sched_get_priority_min_nid_postfix(int policy) {
 }
 
 int APS5_VABI sysarch(int operation, void* parameters) {
+    constexpr int i386GetFsBase = 7;
+    constexpr int i386GetGsBase = 9;
     constexpr int getFsBase = 128;
     constexpr int getGsBase = 130;
     constexpr int setGsBase = 131;
     constexpr std::uint64_t userAddressEnd = 0x0000800000000000ull;
-    if (operation != getFsBase && operation != getGsBase && operation != setGsBase)
+    constexpr std::array<int, 14> definedOperations{0, 1, 3, 4, 7, 8, 9, 10, 11, 128, 129, 130, 131, 132};
+    if (std::find(definedOperations.begin(), definedOperations.end(), operation) == definedOperations.end()) {
+        *__error_nid_postfix() = guestInvalid;
+        return -1;
+    }
+    const bool i386 = operation == i386GetFsBase || operation == i386GetGsBase;
+    if (!i386 && operation != getFsBase && operation != getGsBase && operation != setGsBase)
         NotImplemented_nid_no_patch(("sysarch: operation " + std::to_string(operation)).c_str());
 #if defined(__linux__) && defined(__x86_64__)
     if (parameters == nullptr) {
@@ -491,8 +499,14 @@ int APS5_VABI sysarch(int operation, void* parameters) {
         if (::syscall(SYS_arch_prctl, ARCH_SET_GS, base) != 0) throw std::system_error(errno, std::generic_category(), "sysarch: setting the GS base");
         return 0;
     }
-    if (::syscall(SYS_arch_prctl, operation == getFsBase ? ARCH_GET_FS : ARCH_GET_GS, &base) != 0)
+    const bool fs = operation == getFsBase || operation == i386GetFsBase;
+    if (::syscall(SYS_arch_prctl, fs ? ARCH_GET_FS : ARCH_GET_GS, &base) != 0)
         throw std::system_error(errno, std::generic_category(), "sysarch: reading a segment base");
+    if (i386) {
+        const auto low = static_cast<std::uint32_t>(base);
+        std::memcpy(parameters, &low, sizeof(low));
+        return 0;
+    }
     std::memcpy(parameters, &base, sizeof(base));
     return 0;
 #else

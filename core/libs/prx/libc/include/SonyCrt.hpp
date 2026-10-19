@@ -41,6 +41,20 @@ inline SonyConstraintHandler& SonyConstraintHandlerSlot() {
 
 namespace {
 
+template<typename TInteger>
+inline TInteger ParseInteger(const char* text, char** end, int base, TInteger (*parse)(const char*, char**, int)) {
+#ifdef __APPLE__
+    const int saved = errno;
+    char* parsedEnd = nullptr;
+    const TInteger value = parse(text, &parsedEnd, base);
+    if (parsedEnd == text && errno == EINVAL && (base == 0 || (base >= 2 && base <= 36))) errno = saved;
+    if (end != nullptr) *end = parsedEnd;
+    return value;
+#else
+    return parse(text, end, base);
+#endif
+}
+
 inline void SonyInvokeConstraintHandler(const char* message, void* pointer, int error) {
     SonyConstraintHandler handler = nullptr;
     {
