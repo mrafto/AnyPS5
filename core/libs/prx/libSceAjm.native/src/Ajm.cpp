@@ -14,13 +14,19 @@ extern "C" {
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <condition_variable>
 #include <cstring>
+#include <deque>
+#include <exception>
+#include <functional>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 #include <span>
 
@@ -131,6 +137,7 @@ struct Resampler {
 };
 
 struct Instance {
+    std::mutex lock;
     std::uint32_t context = 0;
     std::uint32_t codec = 0;
     std::uint64_t flags = 0;
@@ -179,7 +186,7 @@ struct Instance {
 };
 
 std::mutex& g_lock = *new std::mutex();
-std::map<std::uint32_t, std::unique_ptr<Instance>>& g_instances = *new std::map<std::uint32_t, std::unique_ptr<Instance>>();
+std::map<std::uint32_t, std::shared_ptr<Instance>>& g_instances = *new std::map<std::uint32_t, std::shared_ptr<Instance>>();
 struct Context {
     std::set<std::uint32_t> instances;
 };
@@ -321,9 +328,10 @@ void WriteResult(void* sideband, std::uint64_t size, std::int32_t result) {
     std::memcpy(sideband, &value, sizeof(value));
 }
 
-Instance* Find(std::uint32_t id) {
+std::shared_ptr<Instance> Find(std::uint32_t id) {
+    std::lock_guard registry(g_lock);
     const auto found = g_instances.find(id);
-    return found == g_instances.end() ? nullptr : found->second.get();
+    return found == g_instances.end() ? nullptr : found->second;
 }
 
 constexpr std::uint8_t AT9_MULTICHANNEL_HEADER = 0x30;
@@ -1539,13 +1547,13 @@ void Execute(std::uint32_t context, const JobHeader& job, const AjmBuffer* input
         if (job.sideband && job.sidebandSize) std::memset(job.sideband, 0, std::min<std::uint64_t>(job.sidebandSize, 24));
         return;
     }
-    std::lock_guard lock(g_lock);
-    auto* instance = Find(job.instance);
+    const auto instance = Find(job.instance);
     if (!instance || instance->context != context) {
         AJM_TRACE("[ajm] job kind %u on unknown instance %u\n", static_cast<unsigned>(job.kind), job.instance);
         WriteResult(job.sideband, job.sidebandSize, AJM_RESULT_INVALID_PARAMETER);
         return;
     }
+    std::lock_guard instanceLock(instance->lock);
     switch (job.kind) {
     case JobKind::Initialize: {
         const std::int32_t result = InitializeInstance(*instance, job.parameters, job.parameterSize);
@@ -1619,6 +1627,150 @@ void Execute(std::uint32_t context, const JobHeader& job, const AjmBuffer* input
     }
 }
 
+struct ByteRange {
+    std::uintptr_t begin;
+    std::uintptr_t end;
+    bool write;
+};
+
+struct JobGroup {
+    std::vector<std::size_t> jobs;
+    std::vector<ByteRange> ranges;
+};
+
+constexpr std::size_t MAX_PARALLEL_GROUPS = 64;
+
+void AddRange(JobGroup& group, const void* pointer, std::uint64_t size, bool write) {
+    if (!pointer || size == 0) return;
+    const auto begin = reinterpret_cast<std::uintptr_t>(pointer);
+    const auto length = static_cast<std::uintptr_t>(std::min<std::uint64_t>(size, std::numeric_limits<std::uintptr_t>::max() - begin));
+    group.ranges.push_back({begin, begin + length, write});
+}
+
+bool GroupsConflict(const JobGroup& left, const JobGroup& right) {
+    for (const ByteRange& a : left.ranges) {
+        for (const ByteRange& b : right.ranges) {
+            if ((a.write || b.write) && a.begin < b.end && b.begin < a.end) return true;
+        }
+    }
+    return false;
+}
+
+std::vector<JobGroup> PlanGroups(const std::vector<ParsedJob>& jobs) {
+    std::vector<JobGroup> groups;
+    std::map<std::uint32_t, std::size_t> byInstance;
+    for (std::size_t index = 0; index < jobs.size(); ++index) {
+        const ParsedJob& parsed = jobs[index];
+        const auto [found, inserted] = byInstance.emplace(parsed.job.instance, groups.size());
+        if (inserted) groups.emplace_back();
+        JobGroup& group = groups[found->second];
+        group.jobs.push_back(index);
+        for (std::uint32_t buffer = 0; buffer < parsed.job.inputCount; ++buffer) AddRange(group, parsed.buffers[buffer].ptr, parsed.buffers[buffer].size, false);
+        for (std::uint32_t buffer = 0; buffer < parsed.job.outputCount; ++buffer) AddRange(group, parsed.buffers[parsed.job.inputCount + buffer].ptr, parsed.buffers[parsed.job.inputCount + buffer].size, true);
+        AddRange(group, parsed.job.sideband, parsed.job.sidebandSize, true);
+    }
+    bool merged = true;
+    while (merged && groups.size() > 1) {
+        merged = false;
+        for (std::size_t left = 0; left < groups.size() && !merged; ++left) {
+            for (std::size_t right = left + 1; right < groups.size() && !merged; ++right) {
+                if (!GroupsConflict(groups[left], groups[right])) continue;
+                JobGroup& target = groups[left];
+                JobGroup& source = groups[right];
+                target.jobs.insert(target.jobs.end(), source.jobs.begin(), source.jobs.end());
+                std::sort(target.jobs.begin(), target.jobs.end());
+                target.ranges.insert(target.ranges.end(), source.ranges.begin(), source.ranges.end());
+                groups.erase(groups.begin() + static_cast<std::ptrdiff_t>(right));
+                merged = true;
+            }
+        }
+    }
+    return groups;
+}
+
+class WorkerPool {
+public:
+    static WorkerPool& Get() {
+        static WorkerPool& pool = *new WorkerPool();
+        return pool;
+    }
+
+    void Post(std::function<void()> task) {
+        {
+            std::lock_guard lock(mutex);
+            tasks.push_back(std::move(task));
+        }
+        wake.notify_one();
+    }
+
+private:
+    WorkerPool() {
+        const std::size_t count = std::clamp<std::size_t>(std::thread::hardware_concurrency() / 2, 1, 4);
+        for (std::size_t index = 0; index < count; ++index) std::thread([this] { Run(); }).detach();
+    }
+
+    void Run() {
+        std::unique_lock lock(mutex);
+        for (;;) {
+            wake.wait(lock, [this] { return !tasks.empty(); });
+            auto task = std::move(tasks.front());
+            tasks.pop_front();
+            lock.unlock();
+            task();
+            lock.lock();
+        }
+    }
+
+    std::mutex mutex;
+    std::condition_variable wake;
+    std::deque<std::function<void()>> tasks;
+};
+
+void RunJobs(std::uint32_t context, std::vector<ParsedJob>& jobs) {
+    const auto run = [context, &jobs](const JobGroup& group) {
+        for (const std::size_t index : group.jobs) {
+            ParsedJob& parsed = jobs[index];
+            Execute(context, parsed.job, parsed.buffers.data(), parsed.buffers.data() + parsed.job.inputCount);
+        }
+    };
+    if (jobs.size() < 2) {
+        for (ParsedJob& parsed : jobs) Execute(context, parsed.job, parsed.buffers.data(), parsed.buffers.data() + parsed.job.inputCount);
+        return;
+    }
+    const std::vector<JobGroup> groups = PlanGroups(jobs);
+    if (groups.size() < 2 || groups.size() > MAX_PARALLEL_GROUPS) {
+        for (ParsedJob& parsed : jobs) Execute(context, parsed.job, parsed.buffers.data(), parsed.buffers.data() + parsed.job.inputCount);
+        return;
+    }
+    std::mutex doneLock;
+    std::condition_variable done;
+    std::size_t remaining = groups.size() - 1;
+    std::vector<std::exception_ptr> failures(groups.size());
+    for (std::size_t index = 1; index < groups.size(); ++index) {
+        WorkerPool::Get().Post([&, index] {
+            try {
+                run(groups[index]);
+            } catch (...) {
+                failures[index] = std::current_exception();
+            }
+            std::lock_guard lock(doneLock);
+            if (--remaining == 0) done.notify_all();
+        });
+    }
+    try {
+        run(groups[0]);
+    } catch (...) {
+        failures[0] = std::current_exception();
+    }
+    {
+        std::unique_lock lock(doneLock);
+        done.wait(lock, [&remaining] { return remaining == 0; });
+    }
+    for (const std::exception_ptr& failure : failures) {
+        if (failure) std::rethrow_exception(failure);
+    }
+}
+
 bool ContextExists(std::uint32_t context) {
     std::lock_guard lock(g_lock);
     return g_contexts.contains(context);
@@ -1678,7 +1830,7 @@ int APS5_VABI sceAjmMemoryUnregister(uint32_t context, void* ptr) {
 int APS5_VABI sceAjmInstanceCreate(uint32_t context, uint32_t codec, uint64_t flags, uint32_t* instance) {
     if (!instance) return SCE_AJM_ERROR_INVALID_PARAMETER;
     if (!ContextExists(context)) return SCE_AJM_ERROR_INVALID_CONTEXT;
-    auto created = std::make_unique<Instance>();
+    auto created = std::make_shared<Instance>();
     created->context = context;
     created->codec = codec;
     created->flags = flags;
@@ -1848,7 +2000,7 @@ int APS5_VABI sceAjmBatchStart(uint32_t context, const AjmBatchInfo* info, int p
         AJM_TRACE("[ajm] batch start: malformed batch rejected with 0x%x\n", static_cast<unsigned>(status));
         return status;
     }
-    for (auto& parsed : jobs) Execute(context, parsed.job, parsed.buffers.data(), parsed.buffers.data() + parsed.job.inputCount);
+    RunJobs(context, jobs);
     if (error) std::memset(error, 0, sizeof(*error));
     const auto id = g_nextBatch.fetch_add(1, std::memory_order_relaxed);
     {

@@ -901,6 +901,78 @@ void TestMalformedBatch(std::uint32_t context) {
     Require(sceAjmInstanceDestroy(context, instance) == 0);
 }
 
+struct FrameOutput {
+    std::vector<std::int16_t> pcm = std::vector<std::int16_t>(1152);
+    DecodeSideband sideband{};
+};
+
+void TestParallelInstances(std::uint32_t context) {
+    constexpr std::size_t instances = 8;
+    constexpr std::size_t framesPerInstance = 3;
+    std::uint32_t parallel[instances];
+    std::uint32_t serial[instances];
+    for (std::size_t index = 0; index < instances; ++index) {
+        Require(sceAjmInstanceCreate(context, 0, 0, &parallel[index]) == 0);
+        Require(sceAjmInstanceCreate(context, 0, 0, &serial[index]) == 0);
+    }
+    std::vector<FrameOutput> together(instances * framesPerInstance);
+    std::vector<FrameOutput> reference(instances * framesPerInstance);
+    std::vector<std::uint8_t> batch(8192);
+    AjmBatchInfo info{};
+    Require(sceAjmBatchInitialize(batch.data(), batch.size(), &info) == 0);
+    for (std::size_t frame = 0; frame < framesPerInstance; ++frame) {
+        for (std::size_t index = 0; index < instances; ++index) {
+            const std::size_t offset = 96 * (frame + index % 2);
+            auto& out = together[index * framesPerInstance + frame];
+            Require(sceAjmBatchJobDecode(&info, parallel[index], MP3_MONO + offset, 96, out.pcm.data(), out.pcm.size() * sizeof(std::int16_t), &out.sideband) == 0);
+        }
+    }
+    std::uint32_t id = 0;
+    AjmBatchError error{};
+    Require(sceAjmBatchStart(context, &info, 0, &error, &id) == 0 && sceAjmBatchWait(context, id, 0, &error) == 0);
+    for (std::size_t index = 0; index < instances; ++index) {
+        for (std::size_t frame = 0; frame < framesPerInstance; ++frame) {
+            const std::size_t offset = 96 * (frame + index % 2);
+            auto& out = reference[index * framesPerInstance + frame];
+            RunDecode(context, serial[index], MP3_MONO + offset, 96, out.pcm.data(), out.pcm.size() * sizeof(std::int16_t), out.sideband);
+        }
+    }
+    for (std::size_t index = 0; index < together.size(); ++index) {
+        Require(together[index].pcm == reference[index].pcm);
+        Require(std::memcmp(&together[index].sideband, &reference[index].sideband, sizeof(DecodeSideband)) == 0);
+        Require(together[index].sideband.totalDecodedSamples == static_cast<std::uint64_t>(index % framesPerInstance + 1) * 1152);
+    }
+    for (std::size_t index = 0; index < instances; ++index) {
+        Require(sceAjmInstanceDestroy(context, parallel[index]) == 0 && sceAjmInstanceDestroy(context, serial[index]) == 0);
+    }
+}
+
+void TestOverlappingOutputs(std::uint32_t context) {
+    for (int round = 0; round < 40; ++round) {
+        std::uint32_t instances[4];
+        for (auto& instance : instances) Require(sceAjmInstanceCreate(context, 0, 0, &instance) == 0);
+        FrameOutput batched;
+        DecodeSideband firstSideband{};
+        DecodeSideband secondSideband{};
+        std::vector<std::uint8_t> batch(1024);
+        AjmBatchInfo info{};
+        Require(sceAjmBatchInitialize(batch.data(), batch.size(), &info) == 0);
+        Require(sceAjmBatchJobDecode(&info, instances[0], MP3_MONO, 96, batched.pcm.data(), batched.pcm.size() * sizeof(std::int16_t), &firstSideband) == 0);
+        Require(sceAjmBatchJobDecode(&info, instances[1], MP3_MONO + 96 * 3, 96, batched.pcm.data(), batched.pcm.size() * sizeof(std::int16_t), &secondSideband) == 0);
+        Submit(context, info);
+        FrameOutput stepwise;
+        DecodeSideband stepFirst{};
+        DecodeSideband stepSecond{};
+        RunDecode(context, instances[2], MP3_MONO, 96, stepwise.pcm.data(), stepwise.pcm.size() * sizeof(std::int16_t), stepFirst);
+        const std::vector<std::int16_t> afterFirst = stepwise.pcm;
+        RunDecode(context, instances[3], MP3_MONO + 96 * 3, 96, stepwise.pcm.data(), stepwise.pcm.size() * sizeof(std::int16_t), stepSecond);
+        Require(afterFirst != stepwise.pcm);
+        Require(batched.pcm == stepwise.pcm);
+        Require(std::memcmp(&firstSideband, &stepFirst, sizeof(DecodeSideband)) == 0 && std::memcmp(&secondSideband, &stepSecond, sizeof(DecodeSideband)) == 0);
+        for (const auto instance : instances) Require(sceAjmInstanceDestroy(context, instance) == 0);
+    }
+}
+
 std::int32_t ClearResult(std::uint32_t context, std::uint32_t instance, std::uint32_t* batchOut = nullptr) {
     std::vector<std::uint8_t> batch(64);
     std::uint32_t sideband[2] = {0xAAAAAAAA, 0xAAAAAAAA};
@@ -1974,6 +2046,8 @@ int main() {
     TestBatchCancel(context);
     TestMalformedBatch(context);
     TestContextOwnership();
+    TestParallelInstances(context);
+    TestOverlappingOutputs(context);
     TestControlAt9(context);
     TestMultichannelAt9(context);
     TestControlMp3(context);
